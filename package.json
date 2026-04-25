@@ -1,6 +1,6 @@
 {
     "name": "@mustafagoksever/java-inspector",
-    "version": "2.0.8",
+    "version": "2.0.9",
     "description": "MCP server that gives AI agents instant access to decompiled Java code from Maven dependencies. Blazing fast Java class analysis for Claude, Cursor, and other LLM-powered IDEs.",
     "main": "dist/index.js",
     "bin": {
