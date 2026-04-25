@@ -18,7 +18,7 @@ AI editors can't read compiled `.class` files. Ask *"How does `JpaRepository` wo
 | Tool | What it does |
 |------|--------------|
 | `scan_dependencies` | Kicks off a background scan of every JAR on the Maven classpath. Call again to poll progress. |
-| `decompile_class` | Returns the **full Java source** (method bodies and all) via CFR 0.152. |
+| `decompile_class` | Returns the **full Java source** (method bodies and all) via CFR 0.152. Optionally extract a single method by `methodName`, or paginate with `offset`/`limit`. |
 | `analyze_class` | Returns the **structural signature** — fields, methods, constructors, inheritance — via `javap`. No method bodies. |
 | `search_class` | Fuzzy-find classes by partial name (e.g. `"ObservationRegistry"`). |
 | `get_inheritance_tree` | Walks the superclass chain up to `java.lang.Object`. |

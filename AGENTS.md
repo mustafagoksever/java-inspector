@@ -22,7 +22,7 @@ TypeScript MCP server that decompiles Java classes from Maven dependencies using
 
 | File | Role |
 |------|------|
-| `src/index.ts` | MCP server (`JavaClassAnalyzerMCPServer`). Exposes 4 tools: `scan_dependencies`, `decompile_class`, `analyze_class`, `search_class`, `get_inheritance_tree` |
+| `src/index.ts` | MCP server (`JavaClassAnalyzerMCPServer`). Exposes 5 tools: `scan_dependencies`, `decompile_class`, `analyze_class`, `search_class`, `get_inheritance_tree` |
 | `src/cli.ts` | Commander CLI. Default action (no args) starts the MCP server |
 | `src/cache/ProjectCache.ts` | Cache I/O: JSONL append-only persistence, in-memory `Map` index, pom/classpath hash validation, file-level locking |
 | `src/scanner/DependencyScanner.ts` | Runs `mvn dependency:build-classpath`, parses JAR paths. Singleton. Integrates BackgroundScanner + LazyResolver |
@@ -30,6 +30,7 @@ TypeScript MCP server that decompiles Java classes from Maven dependencies using
 | `src/scanner/LazyResolver.ts` | On-demand class resolution: O(1) memory lookup, parallel JAR search on cache miss |
 | `src/decompiler/DecompilerService.ts` | Extracts `.class` from JARs (via `yauzl`), runs CFR (`java -jar cfr.jar ...`). Cleans temp `.class` after decompile |
 | `src/analyzer/JavaClassAnalyzer.ts` | Runs `javap -v -cp <jar> <class>` and parses the text output |
+| `src/utils/methodExtractor.ts` | Extracts a single method body from CFR decompiled source via regex + brace matching. Handles strings, line/block comments, nested braces, and abstract methods. |
 | `src/utils/cachePaths.ts` | Cache lives under **`~/.cache/java-inspector/<project>_<hash>/`** |
 
 ## Build & module system
@@ -128,10 +129,16 @@ starts `scan_dependencies` in the background during server initialization. This 
 non-blocking — the server accepts tool calls immediately. If `pom.xml` is not found
 in `cwd`, the server starts normally and waits for manual `scan_dependencies` calls.
 
-### `decompile_class`, `analyze_class`
+### `decompile_class`
 - `ensureScanStarted()` checks if index exists. If not, starts background scan (non-blocking).
 - `findJarForClass()` first checks in-memory `Map` (O(1)). If miss, searches JARs on-demand in parallel batches.
 - Temp `.class` file is **always cleaned up** after decompilation (regardless of `useCache`).
+- **Method extraction**: pass `methodName` to extract a single method body instead of the full class. Uses `methodExtractor.ts` (regex + brace matching).
+- **Pagination**: pass `offset` (1-based) and `limit` to return a slice of lines. `limit=0` means all lines. Ignored when `methodName` is provided.
+
+### `analyze_class`
+- `ensureScanStarted()` checks if index exists. If not, starts background scan (non-blocking).
+- `findJarForClass()` first checks in-memory `Map` (O(1)). If miss, searches JARs on-demand in parallel batches.
 
 ### `search_class`
 - Iterates the live in-memory Map. Returns partial results if background scan is still running.

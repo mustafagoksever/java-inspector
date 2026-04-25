@@ -7,6 +7,7 @@ import {
 import { JavaClassAnalyzer } from './analyzer/JavaClassAnalyzer.js';
 import { DependencyScanner } from './scanner/DependencyScanner.js';
 import { DecompilerService } from './decompiler/DecompilerService.js';
+import { extractMethod } from './utils/methodExtractor.js';
 
 import { fileURLToPath } from 'url';
 import { readFileSync } from 'fs';
@@ -76,7 +77,7 @@ export class JavaClassAnalyzerMCPServer {
                     },
                     {
                         name: 'decompile_class',
-                        description: 'Decompile a Java class from Maven dependencies into full Java source code using CFR. Returns the complete .java source file (method bodies included). Use this when you need to read the actual implementation.',
+                        description: 'Decompile a Java class from Maven dependencies into full Java source code using CFR. Returns the complete .java source file (method bodies included). Optionally extract a single method by name, or paginate with offset/limit. Use this when you need to read the actual implementation.',
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -96,6 +97,20 @@ export class JavaClassAnalyzerMCPServer {
                                 cfrPath: {
                                     type: 'string',
                                     description: 'JAR package path of CFR decompilation tool, optional',
+                                },
+                                methodName: {
+                                    type: 'string',
+                                    description: 'Optional method name to extract instead of the full class. When provided, only the method body is returned.',
+                                },
+                                offset: {
+                                    type: 'number',
+                                    description: 'Start line number (1-based, default: 1)',
+                                    default: 1,
+                                },
+                                limit: {
+                                    type: 'number',
+                                    description: 'Max lines to return (0 = all lines)',
+                                    default: 0,
                                 },
                                 format: {
                                     type: 'string',
@@ -241,7 +256,7 @@ export class JavaClassAnalyzerMCPServer {
                     content: [
                         {
                             type: 'text',
-                            text: `Tool call failed: ${errorMessage}\n\nSuggestions:\n1. Check if input parameters are correct\n2. Ensure necessary preparations have been completed\n3. Check server logs for detailed information`,
+                            text: `Tool call failed: ${errorMessage}`,
                         },
                     ],
                 };
@@ -323,7 +338,7 @@ export class JavaClassAnalyzerMCPServer {
     }
 
     private async handleDecompileClass(args: any, sendProgress?: (message: string, progress?: number, total?: number) => Promise<void>) {
-        const { className, projectPath, useCache = true, cfrPath, format = 'text' } = args;
+        const { className, projectPath, useCache = true, cfrPath, format = 'text', offset = 1, limit = 0 } = args;
         const logger = Logger.get(projectPath);
         const start = performance.now();
         logger.info(`[TOOL:decompile_class] Request: className=${className}, useCache=${useCache}, cfrPath=${cfrPath || 'auto-detect'}`);
@@ -352,19 +367,59 @@ export class JavaClassAnalyzerMCPServer {
                 };
             }
 
+            // Apply method extraction or offset/limit slicing
+            let finalSourceCode = sourceCode;
+            let sliceInfo = '';
+
+            if (args.methodName) {
+                const extracted = extractMethod(sourceCode, args.methodName);
+                if (!extracted) {
+                    return {
+                        content: [{
+                            type: 'text',
+                            text: `Method "${args.methodName}" not found in class ${className}.`,
+                        }],
+                    };
+                }
+                finalSourceCode = extracted;
+                sliceInfo = ` (method: ${args.methodName})`;
+            } else if (offset > 1 || limit > 0) {
+                const lines = sourceCode.split('\n');
+                const totalLines = lines.length;
+
+                const effectiveOffset = offset <= 0 ? 1 : offset;
+                if (effectiveOffset > totalLines) {
+                    return {
+                        content: [{
+                            type: 'text',
+                            text: `Offset ${effectiveOffset} exceeds total lines ${totalLines} for class ${className}.`,
+                        }],
+                    };
+                }
+
+                const effectiveLimit = limit < 0 ? 0 : limit;
+                const startIndex = effectiveOffset - 1;
+                const endIndex = effectiveLimit > 0
+                    ? Math.min(startIndex + effectiveLimit, totalLines)
+                    : totalLines;
+
+                finalSourceCode = lines.slice(startIndex, endIndex).join('\n');
+                sliceInfo = ` (lines ${effectiveOffset}-${endIndex} of ${totalLines})`;
+            }
+
             const duration = ((performance.now() - start) / 1000).toFixed(2);
             logger.info(`[TOOL:decompile_class] Complete in ${duration}s. Source length: ${sourceCode.length} chars.`);
             if (format === 'json') {
                 return {
-                    content: [{ type: 'text', text: `Decompiled ${className}` }],
-                    structuredContent: { className, sourceCode },
+                    content: [{ type: 'text', text: `Decompiled ${className}${sliceInfo}` }],
+                    structuredContent: { className, sourceCode: finalSourceCode },
                 };
             }
             return {
                 content: [
                     {
                         type: 'text',
-                        text: `Decompiled source code for class ${className}:\n\n\`\`\`java\n${sourceCode}\n\`\`\``,
+                        text: `Decompiled source code for class ${className}${sliceInfo}:\n\n\`\`\`java\n${finalSourceCode}\n\`\`\``,
                     },
                 ],
             };
@@ -377,7 +432,7 @@ export class JavaClassAnalyzerMCPServer {
                 content: [
                     {
                         type: 'text',
-                        text: `Decompilation failed: ${errorMessage}\n\nSuggestions:\n1. Ensure scan_dependencies has been run to build class index\n2. Check if CFR tool is properly installed\n3. Verify class name is correct`,
+                        text: `Decompilation failed: ${errorMessage}`,
                     },
                 ],
             };
