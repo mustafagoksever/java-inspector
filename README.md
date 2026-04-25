@@ -1,30 +1,73 @@
 # Java Inspector
 
-**Java source code for AI agents. Instantly. Anywhere.**
+> **Decompile Maven dependencies into readable Java source — directly inside your AI agent.**
 
 [![npm](https://img.shields.io/npm/v/@mustafagoksever/java-inspector)](https://www.npmjs.com/package/@mustafagoksever/java-inspector)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│   AI Agent      │────▶│  java-inspector  │────▶│      Maven      │
-│ (Claude/Cursor) │     │    MCP Server    │     │    + .m2 Repo   │
-└─────────────────┘     └──────────────────┘     └─────────────────┘
-                               │
-                               ▼
-                        ┌──────────────┐
-                        │ CFR 0.152    │
-                        │ Decompiler   │
-                        └──────────────┘
+---
+
+## What is this?
+
+AI editors can't read compiled `.class` files. Ask *"How does `JpaRepository` work?"* and the agent hallucinates.
+
+**Java Inspector** is an MCP server that exposes the internals of your project's Maven dependencies (Spring, Hibernate, Jackson, Micrometer, etc.) as decompiled Java source code. Zero configuration — just point your agent at it.
+
+### Supported operations
+
+| Tool | What it does |
+|------|--------------|
+| `scan_dependencies` | Kicks off a background scan of every JAR on the Maven classpath. Call again to poll progress. |
+| `decompile_class` | Returns the **full Java source** (method bodies and all) via CFR 0.152. |
+| `analyze_class` | Returns the **structural signature** — fields, methods, constructors, inheritance — via `javap`. No method bodies. |
+| `search_class` | Fuzzy-find classes by partial name (e.g. `"ObservationRegistry"`). |
+| `get_inheritance_tree` | Walks the superclass chain up to `java.lang.Object`. |
+
+---
+
+## Architecture
+
+```mermaid
+graph LR
+    A[AI Agent<br/>Claude / Cursor] -->|MCP| B[java-inspector<br/>TypeScript Server]
+    B -->|auto-detect| C{Maven Resolver}
+    C -->|priority 1| D[MAVEN_CMD env]
+    C -->|priority 2| E[mvnd daemon<br/>~2x faster]
+    C -->|priority 3| F[MAVEN_HOME/bin/mvn]
+    C -->|priority 4| G[mvn from PATH]
+    B -->|dependency:build-classpath| H[~/.m2/repository]
+    H -->|JAR streams| I[yauzl extractor]
+    I -->|class names| J[JSON Lines Cache]
+    B -->|cache hit| J
+    B -->|cache miss| I
+    B -->|java -jar cfr.jar| K[CFR 0.152<br/>Decompiler]
+    K -->|*.java source| A
 ```
 
-**Problem:** AI editors can't read compiled `.class` files. How does `JpaRepository` work? The agent guesses.
+### Why JSON Lines?
 
-**Solution:** Open your project's dependency source code to your AI with a single command.
+Traditional JSON caches rewrite the entire file on every batch — O(n²) overhead for large projects. We use **append-only JSON Lines**:
+
+- **Crash-safe**: each line is independent; a truncated final line is skipped on reload.
+- **Fast startup**: the server replays the JSONL into an in-memory `Map<string, ClassIndexEntry>` on launch.
+- **Low memory**: ~35 MB RAM for 100,000 classes.
+
+### Cache layout
+
+```
+~/.cache/java-inspector/<project>_<hash>/
+├── classpath.json      # pomHash + jarPaths[] + classpathHash + timestamp
+├── class-index.jsonl   # Append-only ClassIndexEntry batches
+├── scan-state.json     # jarCount, processedJars[], isComplete
+├── decompile-cache/    # Cached .java sources
+└── server.log          # Append-only structured logs
+```
 
 ---
 
 ## Quick Start
+
+Add to your MCP client config (Claude Desktop, Cursor, etc.):
 
 ```json
 {
@@ -37,117 +80,119 @@
 }
 ```
 
-Restart your AI editor and try: *"Show me the source code of JpaRepository"*
+Restart your editor and ask: *"Show me the source of `ObservationRegistry`"*
 
-**No setup. No configuration. CFR decompiler included.**
+That's it. No `JAVA_HOME` tweaks. No manual CFR download. The server ships the 2.2 MB decompiler inside the package.
 
 ---
 
-## How It Works
+## Workflow
 
-> **Important:** java-inspector **only scans classes inside your project's Maven dependencies**. It does **not** work on your own project's source code under `src/main/java`. Its purpose is to expose the internals of external libraries (Spring, Hibernate, Jackson, etc.) to your AI.
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant A as AI Agent
+    participant S as java-inspector
+    participant M as Maven / mvnd
+    participant C as Cache
 
-| Feature | Description |
-|---------|-------------|
-| `scan_dependencies` | Starts a background scan of Maven dependencies. Call again to check progress or `forceRefresh` to rebuild. |
-| `decompile_class` | Decompiles and returns the **full Java source code** (method bodies included) of a dependency class using CFR |
-| `analyze_class` | Returns the **structural signature** (fields, methods, constructors, superclass, interfaces) of a dependency class using `javap` — no method bodies |
-| `search_class` | Fuzzy search for classes in dependencies by partial name (e.g. `"JpaRepository"`) |
-| `get_inheritance_tree` | Returns the superclass hierarchy of a dependency class |
+    U->>A: "Show me JpaRepository source"
+    A->>S: decompile_class("org.springframework.data.jpa.repository.JpaRepository")
+    alt Index not built yet
+        S->>M: dependency:build-classpath
+        M-->>S: JAR list
+        S->>S: Background scan (20 JARs in parallel)
+        S-->>A: Class found via lazy JAR search
+    else Cache hit
+        S->>C: Map.get(className) — O(1)
+        C-->>S: ClassIndexEntry
+    end
+    S->>S: Extract .class from JAR (yauzl)
+    S->>S: java -jar cfr.jar ...
+    S-->>A: Decompiled .java source
+    A-->>U: Formatted response
+```
 
+---
 
-**Workflow:**
-1. Agent calls any tool (e.g. `decompile_class`)
-2. Server auto-starts a background dependency scan if needed
-3. Class is found via lazy on-demand resolution or from the completed index
-4. Decompiled/analyzed and returned to the agent
+## Performance
 
-| Metric | Before | After |
-|--------|--------|-------|
-| First response | 5–10 minutes | **< 10 seconds** |
-| Subsequent lookups | Slow | **< 50 ms** (in-memory) |
-| AI response accuracy | ~60% (guessing) | **100%** (real source) |
-| Agent timeout risk | High | **None** |
+Real numbers from a **Spring Boot + Vaadin** project (144 dependencies, 17,405 classes):
+
+| Phase | Cold start | Warm cache |
+|-------|-----------|------------|
+| Maven classpath resolve | 5–10 s | — |
+| Background JAR index | 20–30 s | — |
+| Per-class lookup | 2–5 s | **< 1 ms** |
+| Fuzzy search | — | **~30 ms** |
+| CFR decompile (first) | ~2 s | — |
+| CFR decompile (cached) | — | **< 100 ms** |
+
+**First tool call** lands in ~10 seconds (classpath resolve + scan kickoff). **Everything after that** is effectively instant.
+
+---
+
+## Cache invalidation
+
+```mermaid
+flowchart TD
+    A[scan_dependencies called] --> B{isIndexComplete?}
+    B -->|pomHash mismatch| C[Invalidate disk + memory]
+    B -->|classpathHash mismatch| C
+    B -->|both match| D[Return existing index]
+    C --> E[Delete ~/.cache/java-inspector/<hash>/*]
+    E --> F[Re-run Maven dependency:build-classpath]
+    F --> G[Start background scan]
+    D --> H[Return Map of classes]
+```
+
+Invalidation triggers:
+
+1. **Module `pom.xml` changes** — `pomHash` mismatch.
+2. **Parent POM / dependency-management changes** — `classpathHash` mismatch.
+3. **Manual** — call `scan_dependencies` with `forceRefresh: true`.
 
 ---
 
 ## Platform Support
 
-### Windows
-```powershell
-npx -y @mustafagoksever/java-inspector
-```
+| OS | Command |
+|----|---------|
+| Windows | `npx -y @mustafagoksever/java-inspector` |
+| Linux | `npx -y @mustafagoksever/java-inspector` |
+| macOS | `npx -y @mustafagoksever/java-inspector` |
 
-### Linux
-```bash
-npx -y @mustafagoksever/java-inspector
-```
-
-### macOS
-```bash
-npx -y @mustafagoksever/java-inspector
-```
+**Requirements:** Node.js ≥ 16, Java runtime, Maven (or `mvnd` for faster resolves).
 
 ---
 
-## Cache System
+## Environment variables
 
-java-inspector uses a high-performance append-only JSON Lines cache with an in-memory `Map` index.
-
-### Cache Directory
-
-```
-~/.cache/java-inspector/<project_hash>/
-├── classpath.json           # pomHash + JAR list + classpathHash
-├── class-index.jsonl        # Append-only ClassIndexEntry batches
-├── scan-state.json          # Metadata: jarCount, processedJars, isComplete
-└── decompile-cache/         # Cached decompiled .java sources
-```
-
-**Why JSON Lines?**
-- **Append-only writes**: No O(n²) JSON rewrite overhead
-- **Crash-safe**: Each line is independent; corrupted last line is skipped on load
-- **Fast recovery**: Server restart replays JSONL into memory Map
-
-**Cache behavior:**
-- **First tool call:** ~5-10 seconds (Maven `dependency:build-classpath`)
-- **Background scan:** Continues in the background (25 JARs/sec, 20-parallel)
-- **Lookup (cached):** **< 1 ms** (in-memory `Map.get()`)
-- **Search (cached):** **< 50 ms** (in-memory `Map` iteration)
-
-**Cache invalidation:**
-- Module `pom.xml` changes → auto-invalidate
-- Parent POM / dependency management changes → auto-invalidate (`classpathHash`)
-- Manual: call `scan_dependencies` with `forceRefresh: true`
-
-**Clearing the cache:**
-```bash
-# Linux / macOS
-rm -rf ~/.cache/java-inspector
-
-# Windows PowerShell
-Remove-Item -Recurse -Force "$env:USERPROFILE\.cache\java-inspector"
-```
+| Variable | Effect |
+|----------|--------|
+| `JAVA_HOME` | Locates `java` and `javap`. |
+| `MAVEN_HOME` | Locates `mvn` / `mvn.cmd`. |
+| `MAVEN_CMD` | Override executable entirely — e.g. `mvnd`, `mvnw`, or a full path. |
+| `MAVEN_REPO` | Overrides `~/.m2/repository`. |
+| `CFR_PATH` | Use a custom CFR JAR instead of the bundled one. |
+| `NODE_ENV=development` | Enables verbose `server.log` output. |
 
 ---
 
-## Installation Options
+## Installation alternatives
 
-### Zero-Setup (Recommended)
-
+**Zero-setup (recommended)**
 ```bash
 npx @mustafagoksever/java-inspector
 ```
 
-### Global Installation
-
+**Global install**
 ```bash
 npm install -g @mustafagoksever/java-inspector
 java-inspector start
 ```
 
-### Build from Source
-
+**Build from source**
 ```bash
 git clone https://github.com/mustafagoksever/java-inspector.git
 cd java-inspector
@@ -157,79 +202,18 @@ npm run build
 
 ---
 
-## Technical Details
+## Technical stack
 
-```
-java-inspector
-├── Language:     TypeScript 5.7
-├── Runtime:      Node.js 16+
-├── Protocol:     Model Context Protocol (MCP)
-├── Decompiler:   CFR 0.152 (bundled, 2.2MB)
-├── Build:        tsc
-├── Package:      npm (zero-setup via npx)
-├── Platforms:    Windows, Linux, macOS
-└── License:      Apache-2.0
-```
-
-**Key Features:**
-- **Non-blocking startup**: MCP server responds immediately; background scan runs asynchronously
-- **Lazy class resolution**: On-demand JAR scanning when a class is not yet indexed
-- **Parallel batch processing**: 20 JARs processed simultaneously
-- **Smart invalidation**: Detects changes in module POM, parent POM, and effective classpath
-- **Zero external dependencies** — CFR decompiler bundled
-- **Cross-platform** — full support on Windows, Linux, and macOS
-
----
-
-## Performance
-
-| Operation | First Call | Background Scan | Cached |
-|-----------|-----------|-----------------|--------|
-| Maven classpath resolve | ~5-10s | — | — |
-| Background JAR scan | — | ~20-30s (144 JARs) | — |
-| Class lookup (cache miss) | ~2-5s | — | — |
-| Class lookup (cache hit) | — | — | **< 1 ms** |
-| Fuzzy search | — | — | **< 50 ms** |
-| Decompile (first) | ~2s | — | **< 100 ms** |
-| Decompile (cached) | — | — | **< 100 ms** |
-
-**Real world:** Spring Boot + Vaadin project with 144 dependencies, 17,405 classes
-- First tool call: ~10 seconds (classpath resolve + background scan start)
-- Per class (cached): instant
-- Search: ~30 ms
-
----
-
-## Usage Examples
-
-### View source code
-```
-User: "Show me the source code of JpaRepository"
-
-Agent:
-1. Calls decompile_class(className: "org.springframework.data.jpa.repository.JpaRepository")
-2. Server resolves class on-demand or from index
-3. Returns the real decompiled source code
-```
-
-### Search classes (no need for the full name)
-```
-User: "Find classes related to JPA repository"
-
-Agent:
-1. Calls search_class(query: "jpa repository")
-2. Results: JpaRepository, SimpleJpaRepository, QuerydslJpaRepository...
-3. Shows the list to the user, decompiles the one they pick
-```
-
-### Inheritance tree
-```
-User: "Show me the superclasses of JpaRepository"
-
-Agent:
-1. Calls get_inheritance_tree(className: "org.springframework.data.jpa.repository.JpaRepository")
-2. Result: JpaRepository → Repository → ...
-```
+| Layer | Technology |
+|-------|------------|
+| Language | TypeScript 5.7 |
+| Runtime | Node.js 16+ |
+| Protocol | Model Context Protocol (MCP) |
+| Decompiler | CFR 0.152 (bundled) |
+| JAR reader | yauzl (streaming, lazy entries) |
+| Build tool | tsc |
+| Package manager | npm |
+| License | Apache-2.0 |
 
 ---
 
