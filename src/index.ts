@@ -267,7 +267,7 @@ export class JavaClassAnalyzerMCPServer {
 
     private formatResponse(text: string, structured: object, format: string) {
         if (format === 'json') {
-            return { structuredContent: structured };
+            return { content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }] };
         }
         if (format === 'toon') {
             try {
