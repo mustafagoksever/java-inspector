@@ -1,5 +1,6 @@
 import * as path from 'path';
 import * as lockfile from 'proper-lockfile';
+import fs from 'fs-extra';
 import { getProjectCacheDir } from './cachePaths.js';
 
 export interface LockOptions {
@@ -28,6 +29,7 @@ export class CrossProcessLock {
         options: LockOptions = {}
     ): Promise<() => Promise<void>> {
         const cacheDir = getProjectCacheDir(projectPath);
+        await fs.ensureDir(cacheDir);
         const lockFile = path.join(cacheDir, `${lockName}.lock`);
         const opts = { ...DEFAULT_OPTIONS, ...options };
 

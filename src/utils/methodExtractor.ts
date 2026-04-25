@@ -127,6 +127,9 @@ export function extractMethod(sourceCode: string, methodName: string): string | 
             }
         }
 
+        // Line comments end at line boundary since split('\n') removes newline chars
+        inLineComment = false;
+
         if (endIdx !== -1) {
             break;
         }
@@ -171,11 +174,16 @@ export function extractMethodMap(sourceCode: string): MethodLineRange[] {
 
         const startLine = i + 1; // 1-based
 
-        // Find opening brace `{` from startIdx onward
+        // Find opening brace `{` from startIdx onward.
+        // If a semicolon appears before any brace, this is an abstract/interface method.
         let braceIdx = -1;
         for (let k = i; k < lines.length; k++) {
             if (lines[k].includes('{')) {
                 braceIdx = k;
+                break;
+            }
+            if (lines[k].includes(';')) {
+                braceIdx = -1;
                 break;
             }
         }
@@ -240,6 +248,8 @@ export function extractMethodMap(sourceCode: string): MethodLineRange[] {
                         }
                     }
                 }
+                // Line comments end at line boundary since split('\n') removes newline chars
+                inLineComment = false;
                 if (foundEnd) break;
             }
             if (!foundEnd) {

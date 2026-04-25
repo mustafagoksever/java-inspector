@@ -10,8 +10,8 @@ import { DependencyScanner } from '../scanner/DependencyScanner.js';
 import { getDecompileCacheDir, getClassTempDir } from '../utils/cachePaths.js';
 import { Logger } from '../utils/Logger.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __dfFilename = fileURLToPath(import.meta.url);
+const __dfDirname = path.dirname(__dfFilename);
 
 const execFileAsync = promisify(execFile);
 
@@ -280,8 +280,8 @@ export class DecompilerService {
      */
     private getPackageRoot(): string {
         // When running from compiled dist/decompiler/DecompilerService.js
-        // __dirname = dist/decompiler/, so we go up 3 levels to get package root
-        const distDir = path.dirname(__dirname); // dist/
+        // __dfDirname = dist/decompiler/, so we go up 3 levels to get package root
+        const distDir = path.dirname(__dfDirname); // dist/
         return path.dirname(distDir); // package root
     }
 
