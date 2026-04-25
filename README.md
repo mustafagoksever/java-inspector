@@ -18,7 +18,7 @@ AI editors can't read compiled `.class` files. Ask *"How does `JpaRepository` wo
 | Tool | What it does |
 |------|--------------|
 | `scan_dependencies` | Kicks off a background scan of every JAR on the Maven classpath. Call again to poll progress. |
-| `decompile_class` | Returns the **full Java source** (method bodies and all) via CFR 0.152. Optionally extract a single method by `methodName`, or paginate with `offset`/`limit`. |
+| `decompile_class` | Returns the **full Java source** (method bodies and all) via Vineflower. Optionally extract a single method by `methodName`, or paginate with `offset`/`limit`. |
 | `analyze_class` | Returns the **structural signature** — fields, methods, constructors, inheritance — via `javap`. No method bodies. |
 | `search_class` | Fuzzy-find classes by partial name (e.g. `"ObservationRegistry"`). |
 | `get_inheritance_tree` | Walks the superclass chain up to `java.lang.Object`. |
@@ -40,7 +40,7 @@ graph LR
     I -->|class names| J[JSON Lines Cache]
     B -->|cache hit| J
     B -->|cache miss| I
-    B -->|java -jar cfr.jar| K[CFR 0.152<br/>Decompiler]
+    B -->|java -jar vineflower.jar| K[Vineflower 1.11.2<br/>Decompiler]
     K -->|*.java source| A
 ```
 
@@ -59,7 +59,7 @@ Traditional JSON caches rewrite the entire file on every batch — O(n²) overhe
 ├── classpath.json      # pomHash + jarPaths[] + classpathHash + timestamp
 ├── class-index.jsonl   # Append-only ClassIndexEntry batches
 ├── scan-state.json     # jarCount, processedJars[], isComplete
-├── decompile-cache/    # Cached .java sources
+├── decompile-cache-vineflower/  # Cached .java sources
 └── server.log          # Append-only structured logs
 ```
 
@@ -82,7 +82,7 @@ Add to your MCP client config (Claude Desktop, Cursor, etc.):
 
 Restart your editor and ask: *"Show me the source of `ObservationRegistry`"*
 
-That's it. No `JAVA_HOME` tweaks. No manual CFR download. The server ships the 2.2 MB decompiler inside the package.
+That's it. No `JAVA_HOME` tweaks. No manual decompiler download. The server ships the ~1.8 MB Vineflower JAR inside the package.
 
 ---
 
@@ -108,7 +108,7 @@ sequenceDiagram
         C-->>S: ClassIndexEntry
     end
     S->>S: Extract .class from JAR (yauzl)
-    S->>S: java -jar cfr.jar ...
+    S->>S: java -jar vineflower.jar ...
     S-->>A: Decompiled .java source
     A-->>U: Formatted response
 ```
@@ -125,8 +125,8 @@ Real numbers from a **Spring Boot + Vaadin** project (144 dependencies, 17,405 c
 | Background JAR index | 20–30 s | — |
 | Per-class lookup | 2–5 s | **< 1 ms** |
 | Fuzzy search | — | **~30 ms** |
-| CFR decompile (first) | ~2 s | — |
-| CFR decompile (cached) | — | **< 100 ms** |
+| Vineflower decompile (first) | ~2 s | — |
+| Vineflower decompile (cached) | — | **< 100 ms** |
 
 **First tool call** lands in ~10 seconds (classpath resolve + scan kickoff). **Everything after that** is effectively instant.
 
@@ -174,7 +174,7 @@ Invalidation triggers:
 | `MAVEN_HOME` | Locates `mvn` / `mvn.cmd`. |
 | `MAVEN_CMD` | Override executable entirely — e.g. `mvnd`, `mvnw`, or a full path. |
 | `MAVEN_REPO` | Overrides `~/.m2/repository`. |
-| `CFR_PATH` | Use a custom CFR JAR instead of the bundled one. |
+| `DECOMPILER_PATH` | Use a custom Vineflower JAR instead of the bundled one. |
 | `NODE_ENV=development` | Enables verbose `server.log` output. |
 
 ---
@@ -209,7 +209,7 @@ npm run build
 | Language | TypeScript 5.7 |
 | Runtime | Node.js 16+ |
 | Protocol | Model Context Protocol (MCP) |
-| Decompiler | CFR 0.152 (bundled) |
+| Decompiler | Vineflower 1.11.2 (bundled) |
 | JAR reader | yauzl (streaming, lazy entries) |
 | Build tool | tsc |
 | Package manager | npm |

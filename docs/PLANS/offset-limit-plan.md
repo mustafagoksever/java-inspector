@@ -31,7 +31,7 @@ limit: {
 ### 1.2 Handler Logic (`src/index.ts` ~line 265-299)
 
 ```typescript
-const { className, projectPath, useCache = true, cfrPath, offset = 1, limit = 0 } = args;
+const { className, projectPath, useCache = true, decompilerPath, offset = 1, limit = 0 } = args;
 
 // sourceCode alındıktan sonra:
 if (offset > 1 || limit > 0) {

@@ -15,7 +15,7 @@ TypeScript MCP server that decompiles Java classes from Maven dependencies using
 
 ## Runtime requirements
 - **Node.js ≥ 16**
-- **Java runtime** (for CFR decompiler and `javap`)
+- **Java runtime** (for Vineflower decompiler and `javap`)
 - **Maven** (for `dependency:build-classpath` scanning)
 
 ## Architecture & entry points
@@ -30,7 +30,7 @@ TypeScript MCP server that decompiles Java classes from Maven dependencies using
 | `src/scanner/LazyResolver.ts` | On-demand class resolution: O(1) memory lookup, parallel JAR search on cache miss |
 | `src/decompiler/DecompilerService.ts` | Extracts `.class` from JARs (via `yauzl`), runs Vineflower (`java -jar vineflower.jar <class> <outdir>`). Reads generated `.java` from output dir and cleans up temp files |
 | `src/analyzer/JavaClassAnalyzer.ts` | Runs `javap -v -cp <jar> <class>` and parses the text output |
-| `src/utils/methodExtractor.ts` | Extracts a single method body from CFR decompiled source via regex + brace matching. Handles strings, line/block comments, nested braces, and abstract methods. |
+| `src/utils/methodExtractor.ts` | Extracts a single method body from decompiled source via regex + brace matching. Handles strings, line/block comments, nested braces, and abstract methods. |
 | `src/utils/cachePaths.ts` | Cache lives under **`~/.cache/java-inspector/<project>_<hash>/`** |
 
 ## Build & module system

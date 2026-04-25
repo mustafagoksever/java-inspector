@@ -59,4 +59,4 @@ Call `await this.validateProjectPath(args.projectPath);` inside each `case` befo
 
 ## Notes
 - This validation runs **before** `ensureScanStarted`, so invalid paths fail immediately without starting a background scan.
-- `cfrPath` (used by `decompile_class`) is not validated here; it is handled separately inside `DecompilerService`.
+- `decompilerPath` (used by `decompile_class`) is not validated here; it is handled separately inside `DecompilerService`.
