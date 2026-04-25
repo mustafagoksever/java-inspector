@@ -1,10 +1,11 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { getProjectCacheDir } from './cachePaths.js';
+import { getServerLogPath } from './cachePaths.js';
 
 export class Logger {
     private static instances = new Map<string, Logger>();
     private logFile: string;
+    private pid: number;
 
     static get(projectPath: string): Logger {
         if (!this.instances.has(projectPath)) {
@@ -14,10 +15,10 @@ export class Logger {
     }
 
     private constructor(private projectPath: string) {
-        const cacheDir = getProjectCacheDir(projectPath);
-        this.logFile = path.join(cacheDir, 'server.log');
+        this.pid = process.pid;
+        this.logFile = getServerLogPath(projectPath, this.pid);
         try {
-            fs.mkdirSync(cacheDir, { recursive: true });
+            fs.mkdirSync(path.dirname(this.logFile), { recursive: true });
         } catch {
             // ignore
         }
@@ -31,9 +32,9 @@ export class Logger {
         let line: string;
         if (contextMatch) {
             const [, context, rest] = contextMatch;
-            line = `[${timestamp}] [${levelPadded}] ${context} ${rest}\n`;
+            line = `[${timestamp}] [${levelPadded}] [PID:${this.pid}] ${context} ${rest}\n`;
         } else {
-            line = `[${timestamp}] [${levelPadded}] ${msg}\n`;
+            line = `[${timestamp}] [${levelPadded}] [PID:${this.pid}] ${msg}\n`;
         }
         console.error(line.trimEnd());
         try {
@@ -50,7 +51,7 @@ export class Logger {
 
     static clearLog(projectPath: string): void {
         try {
-            const logFile = path.join(getProjectCacheDir(projectPath), 'server.log');
+            const logFile = getServerLogPath(projectPath, process.pid);
             if (fs.existsSync(logFile)) {
                 fs.unlinkSync(logFile);
             }

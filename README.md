@@ -69,11 +69,13 @@ Traditional JSON caches rewrite the entire file on every batch — O(n²) overhe
 
 ```
 ~/.cache/java-inspector/<project>_<hash>/
-├── classpath.json      # pomHash + jarPaths[] + classpathHash + timestamp
-├── class-index.jsonl   # Append-only ClassIndexEntry batches
-├── scan-state.json     # jarCount, processedJars[], isComplete
-├── decompile-cache-vineflower/  # Cached .java sources
-└── server.log          # Append-only structured logs
+├── classpath.json           # pomHash + jarPaths[] + classpathHash + timestamp
+├── class-index.jsonl        # Append-only ClassIndexEntry batches
+├── scan-state.json          # jarCount, processedJars[], isComplete
+├── server-<pid>.log         # Per-process append-only logs (multi-process safe)
+├── write.lock               # Cross-process lock for JSONL / state writes
+├── scan.lock                # Cross-process lock for scan lifecycle
+└── decompile-cache-vineflower/  # Cached .java sources
 ```
 
 ---
@@ -143,6 +145,8 @@ Real numbers from a **Spring Boot + Vaadin** project (144 dependencies, 17,405 c
 
 **First tool call** lands in ~10 seconds (classpath resolve + scan kickoff). **Everything after that** is effectively instant.
 
+**Multi-process safety**: Two-tier cross-process locking via `proper-lockfile` ensures that if multiple MCP server instances target the same project, only one scan runs at a time. The other instances receive a graceful `in_progress` response instead of duplicating work.
+
 ---
 
 ## Cache invalidation
@@ -163,7 +167,7 @@ Invalidation triggers:
 
 1. **Module `pom.xml` changes** — `pomHash` mismatch.
 2. **Parent POM / dependency-management changes** — `classpathHash` mismatch.
-3. **Manual** — call `scan_dependencies` with `forceRefresh: true`.
+3. **Manual** — call `scan_dependencies` with `forceRefresh: true`. This force-releases cross-process locks and wipes the cache directory before restarting.
 
 ---
 

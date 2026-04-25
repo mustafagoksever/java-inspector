@@ -1,0 +1,34 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install base dependencies: curl, gnupg, git, openjdk-21-jdk, maven
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    gnupg \
+    git \
+    openjdk-21-jdk \
+    maven \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 20.x from NodeSource
+RUN mkdir -p /etc/apt/keyrings && \
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list && \
+    apt-get update && apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# Verify tool versions
+RUN node --version && npm --version && java -version 2>&1 | head -1 && mvn --version | head -1 && git --version
+
+# Copy and install java-inspector tarball from local build context
+COPY mustafagoksever-java-inspector-2.2.0.tgz /tmp/
+RUN npm install -g /tmp/mustafagoksever-java-inspector-2.2.0.tgz && rm /tmp/mustafagoksever-java-inspector-2.2.0.tgz
+
+# Install MCP Inspector
+RUN npm install -g @modelcontextprotocol/inspector
+
+WORKDIR /workspace
+
+CMD ["/bin/bash"]

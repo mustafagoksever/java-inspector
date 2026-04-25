@@ -7,6 +7,7 @@ import { backgroundScanner } from './BackgroundScanner.js';
 import { lazyResolver, ScoredClassEntry } from './LazyResolver.js';
 import { getProjectCacheDir } from '../utils/cachePaths.js';
 import { Logger } from '../utils/Logger.js';
+import { CrossProcessLock } from '../utils/CrossProcessLock.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -23,6 +24,8 @@ export class DependencyScanner {
     private static instance: DependencyScanner;
     private classpathPromises = new Map<string, Promise<string[]>>();
     private mavenCommand: string | null = null;
+    // Track scan.lock release functions so we can release when scan completes
+    private scanLockReleases = new Map<string, () => Promise<void>>();
 
     static getInstance(): DependencyScanner {
         if (!DependencyScanner.instance) {
@@ -56,10 +59,16 @@ export class DependencyScanner {
         logger.info(`[SCAN] scanProject called. forceRefresh=${forceRefresh}`);
 
         if (forceRefresh) {
-            logger.info('[SCAN] forceRefresh=true. Invalidating cache...');
+            logger.info('[SCAN] forceRefresh=true. Invalidating cache and breaking locks...');
             await projectCache.invalidate(projectPath);
             backgroundScanner.reset(projectPath);
             this.classpathPromises.delete(projectPath);
+            // Release any stale scan lock held by this process
+            const existingRelease = this.scanLockReleases.get(projectPath);
+            if (existingRelease) {
+                try { await existingRelease(); } catch { /* ignore */ }
+                this.scanLockReleases.delete(projectPath);
+            }
         }
 
         // Check for complete index
@@ -77,7 +86,30 @@ export class DependencyScanner {
             }
         }
 
-        // Check if classpath resolution is already in progress (non-blocking)
+        // Cross-process check: is another process currently scanning?
+        const isLockedByOther = await CrossProcessLock.check(projectPath, 'scan');
+        if (isLockedByOther) {
+            logger.info('[SCAN] Another process is currently scanning this project.');
+            const progress = await projectCache.getScanProgress(projectPath) ?? undefined;
+            const progressText = progress
+                ? `${progress.processed}/${progress.total} JARs processed`
+                : 'scanning in progress';
+            await onProgress?.(
+                `Another process is scanning: ${progressText}`,
+                progress ? Math.floor((progress.processed / progress.total) * 100) : 0,
+                100
+            );
+            return {
+                jarCount: progress?.total ?? 0,
+                classCount: 0,
+                sampleEntries: [],
+                status: 'in_progress',
+                progress,
+                message: 'Another process is currently scanning this project. Please wait or call again later.',
+            };
+        }
+
+        // Check if classpath resolution is already in progress (in-process)
         if (this.classpathPromises.has(projectPath)) {
             await onProgress?.('Maven classpath resolution in progress...', 5, 100);
             return {
@@ -89,7 +121,7 @@ export class DependencyScanner {
             };
         }
 
-        // Check if background scan is already running
+        // Check if background scan is already running (in-process)
         if (backgroundScanner.isScanning(projectPath)) {
             const state = backgroundScanner.getState(projectPath);
             const progress = await projectCache.getScanProgress(projectPath) ?? undefined;
@@ -112,7 +144,8 @@ export class DependencyScanner {
         if (cachedClasspath && cachedClasspath.length > 0) {
             const pomHash = await projectCache.getPomHash(projectPath);
             const classpathHash = projectCache.getClasspathHash(cachedClasspath);
-            backgroundScanner.start(projectPath, cachedClasspath, pomHash, classpathHash, onProgress);
+            // Start scan and hold the cross-process lock until it completes
+            await this.acquireScanLockAndStart(projectPath, cachedClasspath, pomHash, classpathHash, onProgress);
             await onProgress?.(
                 `Background scan started with ${cachedClasspath.length} JARs`,
                 0,
@@ -143,6 +176,45 @@ export class DependencyScanner {
     }
 
     /**
+     * Acquire the cross-process scan lock, start the background scan,
+     * and release the lock when the scan finishes.
+     */
+    private async acquireScanLockAndStart(
+        projectPath: string,
+        jarPaths: string[],
+        pomHash: string,
+        classpathHash: string,
+        onProgress?: (message: string, progress?: number, total?: number) => Promise<void>
+    ): Promise<void> {
+        const logger = Logger.get(projectPath);
+        try {
+            const release = await CrossProcessLock.acquire(projectPath, 'scan');
+            this.scanLockReleases.set(projectPath, release);
+
+            // Start background scan and release lock when done
+            const scanPromise = backgroundScanner.start(
+                projectPath, jarPaths, pomHash, classpathHash, onProgress
+            );
+
+            scanPromise
+                .then(() => {
+                    logger.info('[SCAN] Scan completed, releasing cross-process lock.');
+                })
+                .catch((err) => {
+                    logger.error(`[SCAN] Scan failed: ${err instanceof Error ? err.message : String(err)}`);
+                })
+                .finally(async () => {
+                    try { await release(); } catch { /* ignore */ }
+                    this.scanLockReleases.delete(projectPath);
+                });
+        } catch (lockError) {
+            logger.warn(`[SCAN] Could not acquire scan lock: ${lockError instanceof Error ? lockError.message : String(lockError)}`);
+            // Fall back to starting scan without cross-process lock (best-effort)
+            backgroundScanner.start(projectPath, jarPaths, pomHash, classpathHash, onProgress).catch(() => {});
+        }
+    }
+
+    /**
      * Resolve Maven classpath in the background and start scanning.
      * This runs detached from the caller — errors are logged but not thrown.
      */
@@ -169,7 +241,7 @@ export class DependencyScanner {
 
             logger.info(`[MAVEN] Classpath resolved. ${jarPaths.length} JARs found. Starting background scan...`);
             await onProgress?.(`Classpath resolved: ${jarPaths.length} JARs. Starting background scan...`, 10, 100);
-            backgroundScanner.start(projectPath, jarPaths, pomHash, classpathHash, onProgress);
+            await this.acquireScanLockAndStart(projectPath, jarPaths, pomHash, classpathHash, onProgress);
         } catch (error) {
             this.classpathPromises.delete(projectPath);
             const msg = error instanceof Error ? error.message : String(error);

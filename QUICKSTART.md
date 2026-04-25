@@ -56,6 +56,7 @@ All caching, JAR extraction, and classpath resolution is automatic.
 - **Subsequent calls**: **< 1 ms** lookup, **< 100 ms** decompile (cached)
 - **Memory**: ~35 MB RAM for 100K classes
 - **Cache**: Auto-invalidated when `pom.xml` or classpath changes
+- **Multi-process safe**: Two-tier cross-process locking (`proper-lockfile`) prevents duplicate scans and corrupted JSONL when multiple MCP clients connect to the same project
 
 ---
 

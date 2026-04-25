@@ -608,7 +608,10 @@ export class JavaClassAnalyzerMCPServer {
         }
         const pomPath = path.join(projectPath, 'pom.xml');
         if (!(await fs.pathExists(pomPath))) {
-            throw new Error(`No pom.xml found in ${projectPath}. Ensure this is a Maven project root.`);
+            throw new Error(
+                `No pom.xml found in ${projectPath}. This is not a Maven project. ` +
+                `java-inspector only supports Maven-based Java projects.`
+            );
         }
     }
 
@@ -682,6 +685,8 @@ export class JavaClassAnalyzerMCPServer {
         const pomPath = path.join(cwd, 'pom.xml');
 
         if (!(await fs.pathExists(pomPath))) {
+            const logger = Logger.get(cwd);
+            logger.info('[AUTO-SCAN] No Maven project detected at cwd, skipping auto-scan.');
             return;
         }
 

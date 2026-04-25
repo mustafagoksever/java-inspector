@@ -15,7 +15,8 @@ export class BackgroundScanner {
 
     /**
      * Start a background scan for the given project.
-     * Returns immediately; the scan continues in the background.
+     * Returns a promise that resolves when the scan completes (or rejects on failure).
+     * The scan continues in the background.
      */
     start(
         projectPath: string,
@@ -23,11 +24,14 @@ export class BackgroundScanner {
         pomHash?: string,
         classpathHash?: string,
         onProgress?: (message: string, progress?: number, total?: number) => Promise<void>
-    ): void {
+    ): Promise<void> {
         // Don't start if already running
         if (this.states.has(projectPath)) {
             const existing = this.states.get(projectPath)!;
-            if (!existing.isComplete) return;
+            if (!existing.isComplete) {
+                // Return the existing promise so caller can await completion
+                return existing.promise;
+            }
         }
 
         const state: ScanState = {
@@ -39,9 +43,11 @@ export class BackgroundScanner {
 
         state.promise = this.runScan(projectPath, jarPaths, state, pomHash, classpathHash, onProgress).catch(err => {
             console.error(`Background scan failed for ${projectPath}:`, err);
+            throw err; // Re-throw so the returned promise rejects
         });
 
         this.states.set(projectPath, state);
+        return state.promise;
     }
 
     /**

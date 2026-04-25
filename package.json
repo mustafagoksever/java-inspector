@@ -59,7 +59,7 @@
     "license": "Apache-2.0",
     "repository": {
         "type": "git",
-            "url": "git+https://github.com/mustafagoksever/java-inspector.git"
+        "url": "git+https://github.com/mustafagoksever/java-inspector.git"
     },
     "bugs": {
         "url": "https://github.com/mustafagoksever/java-inspector/issues"
@@ -74,6 +74,7 @@
         "archiver": "^7.0.1",
         "commander": "^14.0.2",
         "fs-extra": "^11.3.3",
+        "proper-lockfile": "^4.1.2",
         "xml2js": "^0.6.2",
         "yauzl": "^3.2.0"
     },
@@ -82,9 +83,11 @@
         "@types/fs-extra": "^11.0.4",
         "@types/jest": "^29.5.13",
         "@types/node": "^22.10.0",
+        "@types/proper-lockfile": "^4.1.4",
         "@types/xml2js": "^0.4.14",
         "@types/yauzl": "^2.10.3",
         "jest": "^29.7.0",
+        "ts-jest": "^29.4.9",
         "tsx": "^4.19.0",
         "typescript": "^5.7.0"
     }

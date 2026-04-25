@@ -42,3 +42,7 @@ export function getClassIndexJsonlPath(projectPath: string): string {
 export function getScanStatePath(projectPath: string): string {
     return path.join(getProjectCacheDir(projectPath), 'scan-state.json');
 }
+
+export function getServerLogPath(projectPath: string, pid: number = process.pid): string {
+    return path.join(getProjectCacheDir(projectPath), `server-${pid}.log`);
+}

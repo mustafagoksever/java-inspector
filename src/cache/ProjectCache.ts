@@ -10,6 +10,7 @@ import {
     getClasspathPath,
 } from '../utils/cachePaths.js';
 import { Logger } from '../utils/Logger.js';
+import { CrossProcessLock } from '../utils/CrossProcessLock.js';
 
 export interface ClassIndexEntry {
     className: string;
@@ -52,10 +53,10 @@ export class ProjectCache {
     private states: Map<string, ScanStateData> = new Map();
     // Deduplicate concurrent loads
     private loadPromises: Map<string, Promise<void>> = new Map();
-    // Per-project write locks
+    // Per-project write locks (in-process)
     private locks: Map<string, Promise<void>> = new Map();
 
-    private async withLock<T>(projectPath: string, fn: () => Promise<T>): Promise<T> {
+    private async withInProcessLock<T>(projectPath: string, fn: () => Promise<T>): Promise<T> {
         while (this.locks.has(projectPath)) {
             await this.locks.get(projectPath);
         }
@@ -223,18 +224,24 @@ export class ProjectCache {
 
     /**
      * Save the classpath list, pom.xml hash, and classpath hash.
+     * Protected by cross-process write.lock.
      */
     async saveClasspath(projectPath: string, jarPaths: string[], pomHash: string): Promise<void> {
-        await this.withLock(projectPath, async () => {
-            const classpathPath = getClasspathPath(projectPath);
-            const data: ClasspathData = {
-                pomHash,
-                jarPaths,
-                classpathHash: this.getClasspathHash(jarPaths),
-                timestamp: new Date().toISOString(),
-            };
-            await fs.outputJson(classpathPath, data, { spaces: 0 });
-        });
+        const release = await CrossProcessLock.acquire(projectPath, 'write');
+        try {
+            await this.withInProcessLock(projectPath, async () => {
+                const classpathPath = getClasspathPath(projectPath);
+                const data: ClasspathData = {
+                    pomHash,
+                    jarPaths,
+                    classpathHash: this.getClasspathHash(jarPaths),
+                    timestamp: new Date().toISOString(),
+                };
+                await fs.outputJson(classpathPath, data, { spaces: 0 });
+            });
+        } finally {
+            await release();
+        }
     }
 
     /**
@@ -345,6 +352,7 @@ export class ProjectCache {
     /**
      * Append entries to the index atomically.
      * Updates both disk (JSONL) and memory (Map).
+     * Protected by cross-process write.lock.
      */
     async appendToClassIndex(
         projectPath: string,
@@ -356,61 +364,67 @@ export class ProjectCache {
     ): Promise<void> {
         if (entries.length === 0 && !processedJars) return;
 
-        await this.withLock(projectPath, async () => {
-            await this.ensureLoaded(projectPath);
+        const release = await CrossProcessLock.acquire(projectPath, 'write');
+        try {
+            await this.withInProcessLock(projectPath, async () => {
+                await this.ensureLoaded(projectPath);
 
-            const index = this.indexes.get(projectPath);
-            if (!index) {
-                this.indexes.set(projectPath, new Map());
-            }
-            const map = this.indexes.get(projectPath)!;
-
-            // Update memory
-            for (const entry of entries) {
-                map.set(entry.className, entry);
-            }
-
-            // Append to JSONL
-            const jsonlPath = getClassIndexJsonlPath(projectPath);
-            const line = JSON.stringify(entries) + '\n';
-            await fs.appendFile(jsonlPath, line, 'utf-8');
-
-            // Update state
-            let state = this.states.get(projectPath);
-            if (!state) {
-                state = {
-                    jarCount: jarCount ?? 0,
-                    processedJars: processedJars ?? [],
-                    isComplete: false,
-                    lastUpdated: new Date().toISOString(),
-                    sampleEntries: [],
-                    pomHash: pomHash ?? '',
-                    classpathHash: classpathHash ?? '',
-                };
-                this.states.set(projectPath, state);
-            } else {
-                if (jarCount !== undefined) state.jarCount = jarCount;
-                if (processedJars) {
-                    state.processedJars = [...new Set([...state.processedJars, ...processedJars])];
+                const index = this.indexes.get(projectPath);
+                if (!index) {
+                    this.indexes.set(projectPath, new Map());
                 }
-                state.lastUpdated = new Date().toISOString();
-                if (pomHash) state.pomHash = pomHash;
-                if (classpathHash) state.classpathHash = classpathHash;
-            }
+                const map = this.indexes.get(projectPath)!;
 
-            // Update sample entries (first 10)
-            const allEntries = Array.from(map.values());
-            state.sampleEntries = allEntries
-                .slice(0, 10)
-                .map((e: ClassIndexEntry) => `${e.className} -> ${e.jarPath.split(/[/\\]/).pop()}`);
+                // Update memory
+                for (const entry of entries) {
+                    map.set(entry.className, entry);
+                }
 
-            // Write scan state
-            await this.writeScanState(projectPath, state);
-        });
+                // Append to JSONL
+                const jsonlPath = getClassIndexJsonlPath(projectPath);
+                const line = JSON.stringify(entries) + '\n';
+                await fs.appendFile(jsonlPath, line, 'utf-8');
+
+                // Update state
+                let state = this.states.get(projectPath);
+                if (!state) {
+                    state = {
+                        jarCount: jarCount ?? 0,
+                        processedJars: processedJars ?? [],
+                        isComplete: false,
+                        lastUpdated: new Date().toISOString(),
+                        sampleEntries: [],
+                        pomHash: pomHash ?? '',
+                        classpathHash: classpathHash ?? '',
+                    };
+                    this.states.set(projectPath, state);
+                } else {
+                    if (jarCount !== undefined) state.jarCount = jarCount;
+                    if (processedJars) {
+                        state.processedJars = [...new Set([...state.processedJars, ...processedJars])];
+                    }
+                    state.lastUpdated = new Date().toISOString();
+                    if (pomHash) state.pomHash = pomHash;
+                    if (classpathHash) state.classpathHash = classpathHash;
+                }
+
+                // Update sample entries (first 10)
+                const allEntries = Array.from(map.values());
+                state.sampleEntries = allEntries
+                    .slice(0, 10)
+                    .map((e: ClassIndexEntry) => `${e.className} -> ${e.jarPath.split(/[/\\]/).pop()}`);
+
+                // Write scan state
+                await this.writeScanState(projectPath, state);
+            });
+        } finally {
+            await release();
+        }
     }
 
     /**
      * Mark the index as complete.
+     * Protected by cross-process write.lock.
      */
     async saveClassIndex(
         projectPath: string,
@@ -418,40 +432,51 @@ export class ProjectCache {
         pomHash?: string,
         classpathHash?: string
     ): Promise<void> {
-        await this.withLock(projectPath, async () => {
-            await this.ensureLoaded(projectPath);
+        const release = await CrossProcessLock.acquire(projectPath, 'write');
+        try {
+            await this.withInProcessLock(projectPath, async () => {
+                await this.ensureLoaded(projectPath);
 
-            let state = this.states.get(projectPath);
-            if (!state) {
-                state = {
-                    jarCount: data.jarCount,
-                    processedJars: [],
-                    isComplete: true,
-                    lastUpdated: new Date().toISOString(),
-                    sampleEntries: data.sampleEntries,
-                    pomHash: pomHash ?? '',
-                    classpathHash: classpathHash ?? '',
-                };
-            } else {
-                state.jarCount = data.jarCount;
-                state.isComplete = true;
-                state.lastUpdated = new Date().toISOString();
-                state.sampleEntries = data.sampleEntries;
-                if (pomHash) state.pomHash = pomHash;
-                if (classpathHash) state.classpathHash = classpathHash;
-            }
+                let state = this.states.get(projectPath);
+                if (!state) {
+                    state = {
+                        jarCount: data.jarCount,
+                        processedJars: [],
+                        isComplete: true,
+                        lastUpdated: new Date().toISOString(),
+                        sampleEntries: data.sampleEntries,
+                        pomHash: pomHash ?? '',
+                        classpathHash: classpathHash ?? '',
+                    };
+                } else {
+                    state.jarCount = data.jarCount;
+                    state.isComplete = true;
+                    state.lastUpdated = new Date().toISOString();
+                    state.sampleEntries = data.sampleEntries;
+                    if (pomHash) state.pomHash = pomHash;
+                    if (classpathHash) state.classpathHash = classpathHash;
+                }
 
-            this.states.set(projectPath, state);
-            await this.writeScanState(projectPath, state);
-        });
+                this.states.set(projectPath, state);
+                await this.writeScanState(projectPath, state);
+            });
+        } finally {
+            await release();
+        }
     }
 
     /**
      * Invalidate all cached data for a project.
+     * Force-releases both write and scan locks before clearing.
      */
     async invalidate(projectPath: string): Promise<void> {
         Logger.get(projectPath).info('[CACHE] Invalidating cache...');
-        await this.withLock(projectPath, async () => {
+
+        // Force-release cross-process locks so another process can take over
+        await CrossProcessLock.release(projectPath, 'write');
+        await CrossProcessLock.release(projectPath, 'scan');
+
+        await this.withInProcessLock(projectPath, async () => {
             this.indexes.delete(projectPath);
             this.states.delete(projectPath);
             this.loadPromises.delete(projectPath);

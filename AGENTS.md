@@ -24,7 +24,7 @@ TypeScript MCP server that decompiles Java classes from Maven dependencies using
 |------|------|
 | `src/index.ts` | MCP server (`JavaClassAnalyzerMCPServer`). Exposes 5 tools: `scan_dependencies`, `decompile_class`, `analyze_class`, `search_class`, `get_inheritance_tree` |
 | `src/cli.ts` | Commander CLI. Default action (no args) starts the MCP server |
-| `src/cache/ProjectCache.ts` | Cache I/O: JSONL append-only persistence, in-memory `Map` index, pom/classpath hash validation, file-level locking |
+| `src/cache/ProjectCache.ts` | Cache I/O: JSONL append-only persistence, in-memory `Map` index, pom/classpath hash validation, **cross-process file locking** via `proper-lockfile` |
 | `src/scanner/DependencyScanner.ts` | Runs `mvn dependency:build-classpath`, parses JAR paths. Singleton. Integrates BackgroundScanner + LazyResolver |
 | `src/scanner/BackgroundScanner.ts` | Background batch parallel JAR scanning (20 JARs at a time). Writes to JSONL incrementally |
 | `src/scanner/LazyResolver.ts` | On-demand class resolution: O(1) memory lookup, parallel JAR search on cache miss |
@@ -85,6 +85,9 @@ Cache lives under the **user home** (`~/.cache/java-inspector/...`), not in the 
 ├── classpath.json           # { pomHash, jarPaths[], classpathHash, timestamp }
 ├── class-index.jsonl        # Append-only JSON Lines. Each line = ClassIndexEntry[]
 ├── scan-state.json          # { jarCount, processedJars[], isComplete, pomHash, classpathHash }
+├── server-<pid>.log         # Per-process append-only logs (PID-separated for multi-process safety)
+├── write.lock               # Cross-process lock for JSONL / state writes
+├── scan.lock                # Cross-process lock for scan lifecycle
 └── decompile-cache/         # Cached decompiled .java sources
 ```
 
@@ -110,9 +113,24 @@ Cache lives under the **user home** (`~/.cache/java-inspector/...`), not in the 
 `isIndexComplete()` checks **both** `pomHash` and `classpathHash`. If either changed, returns `false`, triggering a fresh scan.
 
 ### Locking
-- `ProjectCache.withLock()` serializes write operations per project using a Promise chain.
-- `appendToClassIndex()` acquires lock → appends to JSONL → updates memory Map → writes scan-state → releases lock.
+Two-tier locking prevents race conditions across multiple MCP server instances:
+
+| Lock | Type | Protects | Duration |
+|------|------|----------|----------|
+| `write.lock` | Cross-process (`proper-lockfile`) | JSONL append, state writes, classpath save | Per operation (ms–s) |
+| `scan.lock` | Cross-process (`proper-lockfile`) | Classpath resolution + background scan | Full scan lifecycle (minutes) |
+| In-process Promise | Process-local | Memory Map updates, concurrent deduplication | Per operation |
+
+- `ProjectCache.withInProcessLock()` serializes in-process write operations.
+- `ProjectCache.appendToClassIndex()` acquires **both** `write.lock` (cross-process) and in-process lock.
+- `DependencyScanner.scanProject()` acquires `scan.lock`; released automatically when scan completes or fails.
+- `forceRefresh: true` force-releases both locks before invalidating cache.
 - Reads (from memory Map) do **not** acquire locks.
+
+#### Lock parameters
+- `stale: 60000` (60s) — lock becomes stale if owner dies (SIGKILL)
+- `update: 30000` (30s) — mtime refreshed while owner is alive
+- Process alive → lock never goes stale. Process killed → stale after 60s, then another process can acquire.
 
 ## Tool behavior
 
@@ -120,13 +138,14 @@ Cache lives under the **user home** (`~/.cache/java-inspector/...`), not in the 
 - **Non-blocking**: Returns immediately with status (`complete` or `in_progress`)
 - On first call: resolves Maven classpath (~5-10 s), starts background scan
 - On subsequent calls: returns current progress or cached complete index
-- `forceRefresh`: invalidates disk + memory cache, restarts scan
+- `forceRefresh`: invalidates disk + memory cache, force-releases locks, restarts scan
+- **Cross-process safety**: If another process is already scanning the same project, returns `in_progress` with a message instead of starting a duplicate scan
 
 ### Auto-scan on startup
 If the MCP server is launched from a directory containing `pom.xml`, it automatically
 starts `scan_dependencies` in the background during server initialization. This is
 non-blocking — the server accepts tool calls immediately. If `pom.xml` is not found
-in `cwd`, the server starts normally and waits for manual `scan_dependencies` calls.
+in `cwd`, the server logs `"No Maven project detected at cwd, skipping auto-scan."` and starts normally, waiting for manual `scan_dependencies` calls.
 
 ### `decompile_class`
 - `ensureScanStarted()` checks if index exists. If not, starts background scan (non-blocking).
@@ -146,32 +165,34 @@ in `cwd`, the server starts normally and waits for manual `scan_dependencies` ca
 
 ## Gotchas
 - No Jest config file exists; `npm test` relies on Jest defaults.
-- No actual test files exist in the repo yet.
+- Test files: `src/utils/CrossProcessLock.test.ts` covers cross-process lock behavior.
 - The scanner uses `mvn dependency:build-classpath`, not `dependency:tree`. No regex parsing.
 - `yauzl` is used for ZIP/JAR reading (streams, lazy entries). Be careful with resource leaks; the code already ignores close errors in catch blocks.
 - Inner classes (`$` in filename) are intentionally skipped during index building.
 - Gradle is **not** supported; only Maven.
 - Brute-force fallback (`~/.m2/repository` recursive scan) has been **removed**. If Maven fails, the tool returns an error.
+- Cross-process locking (`proper-lockfile`) uses `mkdir` strategy which works on all platforms including network filesystems.
+- If a process is killed with SIGKILL while holding `scan.lock`, the lock becomes stale after 60s and another process can acquire it.
 
 ## Logging
 
-Each project gets its own append-only log file under the cache directory:
+Each project gets per-process append-only log files under the cache directory:
 ```
-~/.cache/java-inspector/<project>_<hash>/server.log
+~/.cache/java-inspector/<project>_<hash>/server-<pid>.log
 ```
 
 ### Log format
 ```
-[2025-01-15T09:23:45.123Z] [DEBUG] [SERVER] java-inspector v2.0.6 MCP Server running on stdio (DEBUG MODE)
-[2025-01-15T09:23:45.145Z] [INFO]  [AUTO-SCAN] Maven project detected at /path/to/project
-[2025-01-15T09:23:45.200Z] [INFO]  [MAVEN] Resolving command... mvnd detected in 24ms. Selected: mvnd
-[2025-01-15T09:23:45.211Z] [INFO]  [MAVEN] Running: mvnd dependency:build-classpath...
-[2025-01-15T09:24:09.405Z] [INFO]  [MAVEN] Classpath resolved in 24.2s.
-[2025-01-15T09:24:09.410Z] [INFO]  [SCAN] Background scan started. Total JARs: 847
-[2025-01-15T09:24:09.420Z] [DEBUG] [SCAN] Processing batch 1/43 (20 JARs)...
+[2025-01-15T09:23:45.123Z] [DEBUG] [PID:1234] [SERVER] java-inspector v2.0.6 MCP Server running on stdio (DEBUG MODE)
+[2025-01-15T09:23:45.145Z] [INFO]  [PID:1234] [AUTO-SCAN] Maven project detected at /path/to/project
+[2025-01-15T09:23:45.200Z] [INFO]  [PID:1234] [MAVEN] Resolving command... mvnd detected in 24ms. Selected: mvnd
+[2025-01-15T09:23:45.211Z] [INFO]  [PID:1234] [MAVEN] Running: mvnd dependency:build-classpath...
+[2025-01-15T09:24:09.405Z] [INFO]  [PID:1234] [MAVEN] Classpath resolved in 24.2s.
+[2025-01-15T09:24:09.410Z] [INFO]  [PID:1234] [SCAN] Background scan started. Total JARs: 847
+[2025-01-15T09:24:09.420Z] [DEBUG] [PID:1234] [SCAN] Processing batch 1/43 (20 JARs)...
 ...
-[2025-01-15T09:25:10.234Z] [INFO]  [TOOL:analyze_class] Request: className=io.micrometer.observation.ObservationRegistry, filter=all
-[2025-01-15T09:25:10.235Z] [INFO]  [TOOL:analyze_class] Complete in 0.8s. Fields: 12, Methods: 45
+[2025-01-15T09:25:10.234Z] [INFO]  [PID:1234] [TOOL:analyze_class] Request: className=io.micrometer.observation.ObservationRegistry, filter=all
+[2025-01-15T09:25:10.235Z] [INFO]  [PID:1234] [TOOL:analyze_class] Complete in 0.8s. Fields: 12, Methods: 45
 ```
 
 ### Context tags
@@ -185,6 +206,7 @@ Each project gets its own append-only log file under the cache directory:
 | `[DECOMPILE]` | Vineflower decompilation |
 | `[TOOL:<name>]` | Tool call entry/exit with duration |
 | `[CACHE]` | Cache invalidation & state |
+| `[LOCK]` | Cross-process lock acquire/release/compromise |
 
 ### Viewing logs while Opencode is connected
 ```powershell
