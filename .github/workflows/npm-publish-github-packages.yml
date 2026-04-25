@@ -4,8 +4,9 @@
 name: Node.js Package
 
 on:
-  release:
-    types: [created]
+  push:
+    tags:
+      - 'v*'
 
 jobs:
   build:
@@ -15,7 +16,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+      - name: Set version from tag
+        run: npm pkg set version=${GITHUB_REF#refs/tags/v}
       - run: npm ci
+      - run: npm run build
       - run: npx jest --passWithNoTests
 
   publish-npm:
@@ -30,7 +34,10 @@ jobs:
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org/
+      - name: Set version from tag
+        run: npm pkg set version=${GITHUB_REF#refs/tags/v}
       - run: npm ci
+      - run: npm run build
       - run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{secrets.NPM_TOKEN}}
