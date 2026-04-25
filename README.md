@@ -82,7 +82,56 @@ Traditional JSON caches rewrite the entire file on every batch — O(n²) overhe
 
 ## Quick Start
 
-Add to your MCP client config (Claude Desktop, Cursor, Codex, Opencode, etc.):
+Add to your MCP client config:
+
+### Claude Desktop
+
+Edit `%APPDATA%\Claude\claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "java-inspector": {
+      "command": "npx",
+      "args": ["-y", "@mustafagoksever/java-inspector"]
+    }
+  }
+}
+```
+
+### Cursor
+
+`Settings` → `MCP Servers` → Add:
+
+```json
+{
+  "mcpServers": {
+    "java-inspector": {
+      "command": "npx",
+      "args": ["-y", "@mustafagoksever/java-inspector"]
+    }
+  }
+}
+```
+
+### Codex
+
+Edit `%APPDATA%\Codex\config.json`:
+
+```json
+{
+  "mcpServers": {
+    "java-inspector": {
+      "command": "npx",
+      "args": ["-y", "@mustafagoksever/java-inspector"]
+    }
+  }
+}
+```
+
+### Opencode
+
+Edit `%APPDATA%\opencode\config.json`:
 
 ```json
 {
@@ -216,6 +265,58 @@ cd java-inspector
 npm install
 npm run build
 ```
+
+---
+
+## Troubleshooting
+
+### Log Files
+
+All logs are stored in the cache directory under your user home:
+
+```
+~/.cache/java-inspector/<project>_<hash>/server-<pid>.log
+```
+
+**Viewing logs while connected:**
+
+```powershell
+# PowerShell
+Get-Content ~/.cache/java-inspector/<project>_<hash>/server-<pid>.log -Wait -Tail 20
+
+# Unix/macOS
+tail -f ~/.cache/java-inspector/<project>_<hash>/server-<pid>.log
+```
+
+Log files are **cleared when cache is invalidated** (`forceRefresh: true` or hash mismatch).
+
+| Tag | Description |
+|-----|-------------|
+| `[SERVER]` | Server startup/shutdown |
+| `[AUTO-SCAN]` | Automatic scan on startup |
+| `[MAVEN]` | Maven command resolution & classpath building |
+| `[SCAN]` | Background JAR scanning |
+| `[JAVAP]` | `javap` class analysis |
+| `[DECOMPILE]` | Vineflower decompilation |
+| `[TOOL:<name>]` | Tool call entry/exit with duration |
+| `[CACHE]` | Cache invalidation & state |
+| `[LOCK]` | Cross-process lock acquire/release/compromise |
+
+### Common Issues
+
+**"command not found" error**
+- Ensure Node.js and npm are in your PATH.
+
+**Maven not found**
+- Set `MAVEN_HOME` environment variable or ensure Maven is in your PATH.
+- Try using `mvnd` (Maven Daemon) for ~2x faster resolves.
+
+**Lock timeout errors**
+- If a process was killed with SIGKILL while scanning, locks become stale after 60 seconds.
+- Another process can then acquire the lock. No action needed unless the problem persists.
+
+**Cache problems**
+- Call `scan_dependencies` with `forceRefresh: true` to clear cache and restart.
 
 ---
 
