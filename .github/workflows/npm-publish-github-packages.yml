@@ -1,43 +1,63 @@
-# This workflow will run tests using node and then publish a package to npm when a release is created
-# For more information see: https://docs.github.com/en/actions/publishing-packages/publishing-nodejs-packages
-
-name: Node.js Package
+# Java CI - Build, Test and Publish
+name: CI
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  release:
+    types: [published]
+  workflow_dispatch:
 
 jobs:
-  build:
+  build-and-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
-      - name: Set version from tag
-        run: npm pkg set version=${GITHUB_REF#refs/tags/v}
-      - run: npm ci
-      - run: npm run build
-      - run: npx jest --passWithNoTests
+          node-version: '20'
+          cache: 'npm'
 
-  publish-npm:
-    needs: build
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Run tests
+        run: npm test
+
+  publish:
+    needs: build-and-test
     runs-on: ubuntu-latest
+    if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
       id-token: write
     steps:
       - uses: actions/checkout@v4
+      
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
-          registry-url: https://registry.npmjs.org/
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org/'
+          cache: 'npm'
+
       - name: Set version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
         run: npm pkg set version=${GITHUB_REF#refs/tags/v}
-      - run: npm ci
-      - run: npm run build
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
       - name: Check if version already published
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
