@@ -38,6 +38,13 @@ jobs:
         run: npm pkg set version=${GITHUB_REF#refs/tags/v}
       - run: npm ci
       - run: npm run build
-      - run: npm publish --access public
+      - name: Check if version already published
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          if npm view @mustafagoksever/java-inspector@${VERSION} version &>/dev/null; then
+            echo "Version ${VERSION} already published on npm. Skipping publish."
+            exit 0
+          fi
+          npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{secrets.NPM_TOKEN}}
