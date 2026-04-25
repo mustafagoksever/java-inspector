@@ -34,7 +34,7 @@ program
     .option('-p, --project <path>', 'Maven project path')
     .option('-c, --class <className>', 'Class name to test')
     .option('--no-cache', 'Do not use cache')
-    .option('--cfr-path <path>', 'CFR decompiler tool path')
+    .option('--decompiler-path <path>', 'Vineflower decompiler JAR path')
     .action(async (options) => {
 console.log('Test mode - please use test-tools.js for complete testing');
         console.log('Run: node test-tools.js --help for detailed usage');
@@ -54,7 +54,7 @@ program
                         NODE_ENV: "production",
                         MAVEN_REPO: process.env.MAVEN_REPO || "",
                         JAVA_HOME: process.env.JAVA_HOME || "",
-                        CFR_PATH: process.env.CFR_PATH || ""
+                        DECOMPILER_PATH: process.env.DECOMPILER_PATH || ""
                     }
                 }
             }

@@ -17,40 +17,40 @@ const execFileAsync = promisify(execFile);
 
 export class DecompilerService {
     private scanner: DependencyScanner;
-    private cfrPath: string;
+    private decompilerPath: string;
 
     constructor() {
         this.scanner = DependencyScanner.getInstance();
-        this.cfrPath = '';
+        this.decompilerPath = '';
     }
 
-    private async initializeCfrPath(logger?: Logger): Promise<void> {
-        if (!this.cfrPath) {
-            this.cfrPath = await this.findCfrJar(logger);
-            if (!this.cfrPath) {
-                throw new Error('CFR decompiler tool not found. Please download CFR jar to lib directory or set CFR_PATH environment variable');
+    private async initializeDecompilerPath(logger?: Logger): Promise<void> {
+        if (!this.decompilerPath) {
+            this.decompilerPath = await this.findVineflowerJar(logger);
+            if (!this.decompilerPath) {
+                throw new Error('Vineflower decompiler tool not found. Please download Vineflower jar to lib directory or set DECOMPILER_PATH environment variable');
             }
-            logger?.info(`[DECOMPILE] CFR tool path: ${this.cfrPath}`);
-            console.error(`CFR tool path: ${this.cfrPath}`);
+            logger?.info(`[DECOMPILE] Vineflower tool path: ${this.decompilerPath}`);
+            console.error(`Vineflower tool path: ${this.decompilerPath}`);
         }
     }
 
     /**
      * Decompile specified Java class file
      */
-    async decompileClass(className: string, projectPath: string, useCache: boolean = true, cfrPath?: string): Promise<string> {
+    async decompileClass(className: string, projectPath: string, useCache: boolean = true, externalDecompilerPath?: string): Promise<string> {
         const logger = Logger.get(projectPath);
         const start = performance.now();
-        logger.info(`[DECOMPILE] Request: className=${className}, useCache=${useCache}, cfrPath=${cfrPath || 'auto'}`);
+        logger.info(`[DECOMPILE] Request: className=${className}, useCache=${useCache}, decompilerPath=${externalDecompilerPath || 'auto'}`);
 
         try {
-            // If external CFR path is specified, use external path
-            if (cfrPath) {
-                this.cfrPath = cfrPath;
-                logger.info(`[DECOMPILE] Using external CFR: ${this.cfrPath}`);
+            // If external decompiler path is specified, use external path
+            if (externalDecompilerPath) {
+                this.decompilerPath = externalDecompilerPath;
+                logger.info(`[DECOMPILE] Using external decompiler: ${this.decompilerPath}`);
             } else {
-                await this.initializeCfrPath(logger);
-                logger.info(`[DECOMPILE] CFR path: ${this.cfrPath}`);
+                await this.initializeDecompilerPath(logger);
+                logger.info(`[DECOMPILE] Decompiler path: ${this.decompilerPath}`);
             }
 
             // 1. Check cache
@@ -84,11 +84,11 @@ export class DecompilerService {
             const extractDuration = ((performance.now() - extractStart) / 1000).toFixed(2);
             logger.debug(`[DECOMPILE] Extracted .class in ${extractDuration}s: ${path.basename(classFilePath)}`);
 
-            // 4. Use CFR to decompile
-            const cfrStart = performance.now();
-            const sourceCode = await this.decompileWithCfr(classFilePath, logger);
-            const cfrDuration = ((performance.now() - cfrStart) / 1000).toFixed(2);
-            logger.debug(`[DECOMPILE] CFR completed in ${cfrDuration}s. Source length: ${sourceCode.length}`);
+            // 4. Use Vineflower to decompile
+            const decompStart = performance.now();
+            const sourceCode = await this.decompileWithVineflower(classFilePath, className, projectPath, logger);
+            const decompDuration = ((performance.now() - decompStart) / 1000).toFixed(2);
+            logger.debug(`[DECOMPILE] Vineflower completed in ${decompDuration}s. Source length: ${sourceCode.length}`);
 
             // 5. Save to cache
             if (useCache) {
@@ -97,11 +97,11 @@ export class DecompilerService {
                 logger.debug(`[DECOMPILE] Cached result: ${cachePath}`);
             }
 
-            // 6. Clean up temporary .class file (always, since CFR only reads it)
+            // 6. Clean up temporary .class file (always, since decompiler only reads it)
             try {
                 await fs.remove(classFilePath);
             } catch (cleanupError) {
-                logger.warn(`[DECOMPILE] Failed to clean up temp file: ${cleanupError}`);
+                logger.warn(`[DECOMPILE] Failed to clean up temp class file: ${cleanupError}`);
             }
 
             const duration = ((performance.now() - start) / 1000).toFixed(2);
@@ -204,44 +204,74 @@ export class DecompilerService {
     }
 
     /**
-     * Use CFR to decompile .class file
+     * Use Vineflower to decompile .class file.
+     * Vineflower writes output to a directory, so we create a temporary
+     * output folder, run the decompiler, read the generated .java file,
+     * and clean up afterwards.
      */
-    private async decompileWithCfr(classFilePath: string, logger?: Logger): Promise<string> {
-        if (!this.cfrPath) {
-            throw new Error('CFR decompiler tool not found, please ensure CFR jar is in classpath');
+    private async decompileWithVineflower(classFilePath: string, className: string, projectPath: string, logger?: Logger): Promise<string> {
+        if (!this.decompilerPath) {
+            throw new Error('Vineflower decompiler tool not found, please ensure Vineflower jar is in classpath');
         }
+
+        const outputDir = path.join(getClassTempDir(projectPath), `vine-out-${Date.now()}`);
+        await fs.ensureDir(outputDir);
 
         try {
             const javaCmd = this.getJavaCommand(logger);
-            const cmdMsg = `Executing CFR: ${javaCmd} -jar "${this.cfrPath}" "${classFilePath}"`;
+            const cmdMsg = `Executing Vineflower: ${javaCmd} -jar "${this.decompilerPath}" "${classFilePath}" "${outputDir}"`;
             logger?.debug(`[DECOMPILE] ${cmdMsg}`);
             console.error(cmdMsg);
 
             const { stdout, stderr } = await execFileAsync(
                 javaCmd,
-                ['-jar', this.cfrPath, classFilePath, '--silent', 'true'],
+                ['-jar', this.decompilerPath, classFilePath, outputDir],
                 {
                     timeout: 30000
                 }
             );
 
             if (stderr && stderr.trim()) {
-                logger?.warn(`[DECOMPILE] CFR stderr: ${stderr}`);
-                console.warn('CFR warning:', stderr);
+                // Vineflower logs INFO/WARN to stderr; only surface real errors
+                const errorLines = stderr.split('\n').filter((line: string) =>
+                    line.toLowerCase().includes('error') || line.toLowerCase().includes('exception')
+                );
+                if (errorLines.length > 0) {
+                    logger?.warn(`[DECOMPILE] Vineflower stderr errors: ${errorLines.join('\n')}`);
+                } else {
+                    logger?.debug(`[DECOMPILE] Vineflower stderr: ${stderr.substring(0, 500)}`);
+                }
             }
 
-            if (!stdout || stdout.trim() === '') {
-                throw new Error('CFR decompilation returned empty result, possibly due to corrupted class file or incompatible CFR version');
+            // Vineflower writes <outputDir>/<SimpleClassName>.java for single-class decompilation
+            const simpleName = className.substring(className.lastIndexOf('.') + 1);
+            const outputFilePath = path.join(outputDir, `${simpleName}.java`);
+
+            if (!(await fs.pathExists(outputFilePath))) {
+                throw new Error(`Vineflower did not produce expected output file: ${outputFilePath}. stdout: ${stdout || '(empty)'}`);
             }
 
-            return stdout;
+            const sourceCode = await readFile(outputFilePath, 'utf-8');
+
+            if (!sourceCode || sourceCode.trim() === '') {
+                throw new Error('Vineflower decompilation returned empty result, possibly due to corrupted class file or incompatible decompiler version');
+            }
+
+            return sourceCode;
         } catch (error) {
-            logger?.error(`[DECOMPILE] CFR execution failed: ${error instanceof Error ? error.message : String(error)}`);
-            console.error('CFR decompilation execution failed:', error);
+            logger?.error(`[DECOMPILE] Vineflower execution failed: ${error instanceof Error ? error.message : String(error)}`);
+            console.error('Vineflower decompilation execution failed:', error);
             if (error instanceof Error && error.message.includes('timeout')) {
-                throw new Error('CFR decompilation timeout, please check Java environment and CFR tool');
+                throw new Error('Vineflower decompilation timeout, please check Java environment and decompiler tool');
             }
-            throw new Error(`CFR decompilation failed: ${error instanceof Error ? error.message : String(error)}`);
+            throw new Error(`Vineflower decompilation failed: ${error instanceof Error ? error.message : String(error)}`);
+        } finally {
+            // Always clean up temporary output directory
+            try {
+                await fs.remove(outputDir);
+            } catch (cleanupError) {
+                logger?.warn(`[DECOMPILE] Failed to clean up temp output dir: ${cleanupError}`);
+            }
         }
     }
 
@@ -256,69 +286,58 @@ export class DecompilerService {
     }
 
     /**
-     * Find CFR jar package path
+     * Find Vineflower jar package path
      */
-    private async findCfrJar(logger?: Logger): Promise<string> {
-        // 1. Check CFR_PATH env var first (allows custom CFR version)
-        if (process.env.CFR_PATH) {
-            logger?.debug(`[DECOMPILE] CFR_PATH set: ${process.env.CFR_PATH}`);
-            if (await fs.pathExists(process.env.CFR_PATH)) {
-                logger?.debug(`[DECOMPILE] CFR_PATH resolved successfully.`);
-                return process.env.CFR_PATH;
+    private async findVineflowerJar(logger?: Logger): Promise<string> {
+        // 1. Check DECOMPILER_PATH env var first (allows custom version)
+        if (process.env.DECOMPILER_PATH) {
+            logger?.debug(`[DECOMPILE] DECOMPILER_PATH set: ${process.env.DECOMPILER_PATH}`);
+            if (await fs.pathExists(process.env.DECOMPILER_PATH)) {
+                logger?.debug(`[DECOMPILE] DECOMPILER_PATH resolved successfully.`);
+                return process.env.DECOMPILER_PATH;
             }
-            logger?.warn(`[DECOMPILE] CFR_PATH file does not exist: ${process.env.CFR_PATH}`);
+            logger?.warn(`[DECOMPILE] DECOMPILER_PATH file does not exist: ${process.env.DECOMPILER_PATH}`);
         }
 
-        // 2. Try bundled CFR at package root lib/ (works with npx and npm install)
+        // 2. Try bundled Vineflower at package root lib/ (works with npx and npm install)
         const bundledLibPath = path.join(this.getPackageRoot(), 'lib');
-        logger?.debug(`[DECOMPILE] Checking bundled CFR at: ${bundledLibPath}`);
+        logger?.debug(`[DECOMPILE] Checking bundled Vineflower at: ${bundledLibPath}`);
         if (await fs.pathExists(bundledLibPath)) {
             const files = await readdir(bundledLibPath);
-            const cfrJar = files.find(file => /^cfr-.*\.jar$/.test(file));
-            if (cfrJar) {
-                logger?.debug(`[DECOMPILE] Bundled CFR found: ${cfrJar}`);
-                return path.join(bundledLibPath, cfrJar);
+            const vineflowerJar = files.find(file => /^vineflower-.*\.jar$/.test(file));
+            if (vineflowerJar) {
+                logger?.debug(`[DECOMPILE] Bundled Vineflower found: ${vineflowerJar}`);
+                return path.join(bundledLibPath, vineflowerJar);
             }
-            logger?.debug(`[DECOMPILE] No cfr-*.jar in bundled lib. Files: ${files.join(', ')}`);
+            logger?.debug(`[DECOMPILE] No vineflower-*.jar in bundled lib. Files: ${files.join(', ')}`);
         }
 
         // 3. Try current working directory lib/ (for local development)
         const cwdLibPath = path.join(process.cwd(), 'lib');
-        logger?.debug(`[DECOMPILE] Checking local CFR at: ${cwdLibPath}`);
+        logger?.debug(`[DECOMPILE] Checking local Vineflower at: ${cwdLibPath}`);
         if (await fs.pathExists(cwdLibPath)) {
             const files = await readdir(cwdLibPath);
-            const cfrJar = files.find(file => /^cfr-.*\.jar$/.test(file));
-            if (cfrJar) {
-                logger?.debug(`[DECOMPILE] Local CFR found: ${cfrJar}`);
-                return path.join(cwdLibPath, cfrJar);
+            const vineflowerJar = files.find(file => /^vineflower-.*\.jar$/.test(file));
+            if (vineflowerJar) {
+                logger?.debug(`[DECOMPILE] Local Vineflower found: ${vineflowerJar}`);
+                return path.join(cwdLibPath, vineflowerJar);
             }
-            logger?.debug(`[DECOMPILE] No cfr-*.jar in local lib. Files: ${files.join(', ')}`);
+            logger?.debug(`[DECOMPILE] No vineflower-*.jar in local lib. Files: ${files.join(', ')}`);
         }
 
-        // 4. Try CLASSPATH (legacy support)
-        const classpath = process.env.CLASSPATH || '';
-        logger?.debug(`[DECOMPILE] Checking CLASSPATH for CFR. Entries: ${classpath.split(path.delimiter).length}`);
-        const classpathEntries = classpath.split(path.delimiter);
-        for (const entry of classpathEntries) {
-            if (entry.includes('cfr') && entry.endsWith('.jar') && await fs.pathExists(entry)) {
-                logger?.debug(`[DECOMPILE] CFR found in CLASSPATH: ${entry}`);
-                return entry;
-            }
-        }
-
-        logger?.error(`[DECOMPILE] CFR jar not found in any location.`);
+        logger?.error(`[DECOMPILE] Vineflower jar not found in any location.`);
         return '';
     }
 
     /**
      * Batch decompile multiple classes
      */
-    async decompileClasses(classNames: string[], projectPath: string, useCache: boolean = true, cfrPath?: string): Promise<Map<string, string>> {
+    async decompileClasses(classNames: string[], projectPath: string, useCache: boolean = true, externalDecompilerPath?: string): Promise<Map<string, string>> {
         const results = new Map<string, string>();
 
         for (const className of classNames) {
             try {
-                const sourceCode = await this.decompileClass(className, projectPath, useCache, cfrPath);
+                const sourceCode = await this.decompileClass(className, projectPath, useCache, externalDecompilerPath);
                 results.set(className, sourceCode);
             } catch (error) {
                 console.warn(`Failed to decompile class ${className}: ${error}`);

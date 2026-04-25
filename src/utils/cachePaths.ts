@@ -16,7 +16,7 @@ export function getProjectCacheDir(projectPath: string): string {
 }
 
 export function getDecompileCacheDir(projectPath: string): string {
-    return path.join(getProjectCacheDir(projectPath), 'decompile-cache');
+    return path.join(getProjectCacheDir(projectPath), 'decompile-cache-vineflower');
 }
 
 export function getClassTempDir(projectPath: string): string {

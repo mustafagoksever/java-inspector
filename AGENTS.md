@@ -1,7 +1,7 @@
 # Agent Instructions — java-inspector
 
 ## What this is
-TypeScript MCP server that decompiles Java classes from Maven dependencies using CFR. Ships as an npm package with a bundled CFR JAR.
+TypeScript MCP server that decompiles Java classes from Maven dependencies using Vineflower. Ships as an npm package with a bundled Vineflower JAR.
 
 ## Developer commands
 
@@ -28,7 +28,7 @@ TypeScript MCP server that decompiles Java classes from Maven dependencies using
 | `src/scanner/DependencyScanner.ts` | Runs `mvn dependency:build-classpath`, parses JAR paths. Singleton. Integrates BackgroundScanner + LazyResolver |
 | `src/scanner/BackgroundScanner.ts` | Background batch parallel JAR scanning (20 JARs at a time). Writes to JSONL incrementally |
 | `src/scanner/LazyResolver.ts` | On-demand class resolution: O(1) memory lookup, parallel JAR search on cache miss |
-| `src/decompiler/DecompilerService.ts` | Extracts `.class` from JARs (via `yauzl`), runs CFR (`java -jar cfr.jar ...`). Cleans temp `.class` after decompile |
+| `src/decompiler/DecompilerService.ts` | Extracts `.class` from JARs (via `yauzl`), runs Vineflower (`java -jar vineflower.jar <class> <outdir>`). Reads generated `.java` from output dir and cleans up temp files |
 | `src/analyzer/JavaClassAnalyzer.ts` | Runs `javap -v -cp <jar> <class>` and parses the text output |
 | `src/utils/methodExtractor.ts` | Extracts a single method body from CFR decompiled source via regex + brace matching. Handles strings, line/block comments, nested braces, and abstract methods. |
 | `src/utils/cachePaths.ts` | Cache lives under **`~/.cache/java-inspector/<project>_<hash>/`** |
@@ -38,14 +38,13 @@ TypeScript MCP server that decompiles Java classes from Maven dependencies using
 - `tsc` emits to `dist/` with `.js`, `.d.ts`, and source maps
 - `tsconfig.json` excludes `**/*.test.ts`
 
-## Bundled CFR JAR — do not break
-- The repo ships `lib/cfr-0.152.jar` (~2.2 MB)
-- `.gitignore` has `lib/cfr-*.jar` **and** `!lib/cfr-0.152.jar` to allow tracking this specific JAR
-- `DecompilerService.findCfrJar()` resolution order:
-  1. `CFR_PATH` env var
+## Bundled Vineflower JAR — do not break
+- The repo ships `lib/vineflower-1.11.2.jar` (~1.8 MB)
+- `.gitignore` has `lib/vineflower-*.jar` **and** `!lib/vineflower-*.jar` to allow tracking the shipped JAR
+- `DecompilerService.findVineflowerJar()` resolution order:
+  1. `DECOMPILER_PATH` env var
   2. `<packageRoot>/lib/` (for npx / global install)
   3. `<cwd>/lib/` (for local development)
-  4. `CLASSPATH`
 - `getPackageRoot()` assumes built layout: `dist/decompiler/DecompilerService.js` → up 3 levels. If you move files, update this.
 
 ## Environment variables
@@ -56,7 +55,7 @@ TypeScript MCP server that decompiles Java classes from Maven dependencies using
 | `MAVEN_HOME` | Locates `mvn` / `mvn.cmd` |
 | `MAVEN_CMD` | Override Maven executable (e.g., `mvnd`, `mvnw`, full path) |
 | `MAVEN_REPO` | Overrides local Maven repo path (default: `~/.m2/repository`) |
-| `CFR_PATH` | Override CFR JAR location |
+| `DECOMPILER_PATH` | Override Vineflower JAR location |
 
 ### Maven command resolution order
 1. `MAVEN_CMD` env var (explicit override)
@@ -66,7 +65,7 @@ TypeScript MCP server that decompiles Java classes from Maven dependencies using
 
 ## Timeouts
 - JAR class extraction (background scan): 30 s per JAR (`extractClassesFromJarWithTimeout`)
-- CFR decompilation: 30 s (`decompileWithCfr`)
+- Vineflower decompilation: 30 s (`decompileWithVineflower`)
 - `javap` analysis: 10 s (`analyzeClassWithJavap`)
 - Maven `dependency:build-classpath`: 120 s timeout
 - Lazy JAR search (on-demand): 5 s per JAR (`findClassInJar`)
@@ -133,6 +132,7 @@ in `cwd`, the server starts normally and waits for manual `scan_dependencies` ca
 - `ensureScanStarted()` checks if index exists. If not, starts background scan (non-blocking).
 - `findJarForClass()` first checks in-memory `Map` (O(1)). If miss, searches JARs on-demand in parallel batches.
 - Temp `.class` file is **always cleaned up** after decompilation (regardless of `useCache`).
+- Vineflower writes output to a temporary directory; the generated `.java` file is read and the temp directory is cleaned up automatically.
 - **Method extraction**: pass `methodName` to extract a single method body instead of the full class. Uses `methodExtractor.ts` (regex + brace matching).
 - **Pagination**: pass `offset` (1-based) and `limit` to return a slice of lines. `limit=0` means all lines. Ignored when `methodName` is provided.
 
@@ -182,7 +182,7 @@ Each project gets its own append-only log file under the cache directory:
 | `[MAVEN]` | Maven command resolution & classpath building |
 | `[SCAN]` | Background JAR scanning |
 | `[JAVAP]` | `javap` class analysis |
-| `[DECOMPILE]` | CFR decompilation |
+| `[DECOMPILE]` | Vineflower decompilation |
 | `[TOOL:<name>]` | Tool call entry/exit with duration |
 | `[CACHE]` | Cache invalidation & state |
 

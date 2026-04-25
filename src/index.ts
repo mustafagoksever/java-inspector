@@ -77,7 +77,7 @@ export class JavaClassAnalyzerMCPServer {
                     },
                     {
                         name: 'decompile_class',
-                        description: 'Decompile a Java class from Maven dependencies into full Java source code using CFR. Returns the complete .java source file (method bodies included). Optionally extract a single method by name, or paginate with offset/limit. Use this when you need to read the actual implementation.',
+                        description: 'Decompile a Java class from Maven dependencies into full Java source code using Vineflower. Returns the complete .java source file (method bodies included). Optionally extract a single method by name, or paginate with offset/limit. Use this when you need to read the actual implementation.',
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -94,9 +94,9 @@ export class JavaClassAnalyzerMCPServer {
                                     description: 'Whether to use cache, default true',
                                     default: true,
                                 },
-                                cfrPath: {
+                                decompilerPath: {
                                     type: 'string',
-                                    description: 'JAR package path of CFR decompilation tool, optional',
+                                    description: 'JAR package path of Vineflower decompiler, optional',
                                 },
                                 methodName: {
                                     type: 'string',
@@ -338,11 +338,11 @@ export class JavaClassAnalyzerMCPServer {
     }
 
     private async handleDecompileClass(args: any, sendProgress?: (message: string, progress?: number, total?: number) => Promise<void>) {
-        const { className, projectPath, useCache = true, cfrPath, format = 'text', offset = 1, limit = 0 } = args;
+        const { className, projectPath, useCache = true, decompilerPath, format = 'text', offset = 1, limit = 0 } = args;
         const logger = Logger.get(projectPath);
         const start = performance.now();
-        logger.info(`[TOOL:decompile_class] Request: className=${className}, useCache=${useCache}, cfrPath=${cfrPath || 'auto-detect'}`);
-        this.logToolDebug(logger, 'decompile_class', projectPath, { className, useCache, cfrPath: cfrPath || 'auto-detect' });
+        logger.info(`[TOOL:decompile_class] Request: className=${className}, useCache=${useCache}, decompilerPath=${decompilerPath || 'auto-detect'}`);
+        this.logToolDebug(logger, 'decompile_class', projectPath, { className, useCache, decompilerPath: decompilerPath || 'auto-detect' });
 
         try {
             await sendProgress?.(`Starting decompilation of class: ${className}`, 0, 100);
@@ -352,7 +352,7 @@ export class JavaClassAnalyzerMCPServer {
             await this.ensureScanStarted(projectPath, sendProgress);
 
             await sendProgress?.('Decompiling class...', 50, 100);
-            const sourceCode = await this.decompiler.decompileClass(className, projectPath, useCache, cfrPath);
+            const sourceCode = await this.decompiler.decompileClass(className, projectPath, useCache, decompilerPath);
 
             await sendProgress?.('Decompilation complete', 100, 100);
 
@@ -361,7 +361,7 @@ export class JavaClassAnalyzerMCPServer {
                     content: [
                         {
                             type: 'text',
-                            text: `Warning: Decompilation result for class ${className} is empty, possibly due to CFR tool issues or corrupted class file`,
+                            text: `Warning: Decompilation result for class ${className} is empty, possibly due to Vineflower decompiler issues or corrupted class file`,
                         },
                     ],
                 };
@@ -709,7 +709,7 @@ export class JavaClassAnalyzerMCPServer {
             MAVEN_HOME: process.env.MAVEN_HOME,
             MAVEN_CMD: process.env.MAVEN_CMD,
             MAVEN_REPO: process.env.MAVEN_REPO,
-            CFR_PATH: process.env.CFR_PATH,
+            DECOMPILER_PATH: process.env.DECOMPILER_PATH,
         };
     }
 
