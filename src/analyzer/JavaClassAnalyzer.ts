@@ -29,6 +29,12 @@ export interface ClassAnalysis {
     methods: ClassMethod[];
 }
 
+export interface HierarchyEntry {
+    className: string;
+    level: number;
+    resolved: boolean;
+}
+
 export class JavaClassAnalyzer {
     private scanner: DependencyScanner;
 
@@ -401,19 +407,37 @@ export class JavaClassAnalyzer {
     /**
      * Get class inheritance hierarchy
      */
-    async getInheritanceHierarchy(className: string, projectPath: string): Promise<string[]> {
-        const analysis = await this.analyzeClass(className, projectPath);
-        const hierarchy: string[] = [className];
+    async getInheritanceHierarchy(className: string, projectPath: string): Promise<HierarchyEntry[]> {
+        const hierarchy: HierarchyEntry[] = [];
+        let currentName = className;
+        let level = 0;
 
-        if (analysis.superClass) {
+        while (currentName) {
+            let resolved = false;
+            let superClass: string | undefined;
+
             try {
-                const superHierarchy = await this.getInheritanceHierarchy(analysis.superClass, projectPath);
-                hierarchy.unshift(...superHierarchy);
-            } catch (error) {
-                // If parent class is not in current project, add directly
-                hierarchy.unshift(analysis.superClass);
+                const analysis = await this.analyzeClass(currentName, projectPath, false);
+                resolved = true;
+                superClass = analysis.superClass;
+            } catch {
+                // Class not found in indexed dependencies
+                resolved = false;
             }
+
+            hierarchy.unshift({ className: currentName, level: 0, resolved });
+
+            if (!superClass) {
+                break;
+            }
+            currentName = superClass;
+            level++;
         }
+
+        // Re-assign levels so root is 0
+        hierarchy.forEach((entry, idx) => {
+            entry.level = idx;
+        });
 
         return hierarchy;
     }

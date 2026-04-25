@@ -23,13 +23,26 @@ AI editors can't read compiled `.class` files. Ask *"How does `JpaRepository` wo
 | `search_class` | Fuzzy-find classes by partial name (e.g. `"ObservationRegistry"`). |
 | `get_inheritance_tree` | Walks the superclass chain up to `java.lang.Object`. |
 
+### Response formats
+
+Every tool accepts a `format` parameter (`text` | `json` | `toon`). Default is `text`.
+
+| Format | What you get | Best for |
+|--------|-------------|----------|
+| `text` | Human-readable markdown, tables, code blocks | Reading by LLMs and humans |
+| `json` | Pure `structuredContent` — no text wrapper | Programmatic consumption, piping to other tools |
+| `toon` | [Token-Oriented Object Notation](https://github.com/toon-format/toon) — compact, schema-aware text | LLM prompts where token count matters (~40% fewer tokens than JSON) |
+
+**`json`** strips the text wrapper and returns only the structured payload.  
+**`toon`** encodes the same payload via `@toon-format/toon`, giving you YAML-like readability with CSV-like compactness for uniform arrays.
+
 ---
 
 ## Architecture
 
 ```mermaid
 graph LR
-    A[AI Agent<br/>Claude / Cursor] -->|MCP| B[java-inspector<br/>TypeScript Server]
+    A[AI Agent<br/>Claude / Cursor / Codex / Opencode] -->|MCP| B[java-inspector<br/>TypeScript Server]
     B -->|auto-detect| C{Maven Resolver}
     C -->|priority 1| D[MAVEN_CMD env]
     C -->|priority 2| E[mvnd daemon<br/>~2x faster]
@@ -67,7 +80,7 @@ Traditional JSON caches rewrite the entire file on every batch — O(n²) overhe
 
 ## Quick Start
 
-Add to your MCP client config (Claude Desktop, Cursor, etc.):
+Add to your MCP client config (Claude Desktop, Cursor, Codex, Opencode, etc.):
 
 ```json
 {

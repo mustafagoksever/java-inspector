@@ -13,7 +13,6 @@ const execFileAsync = promisify(execFile);
 export interface ScanResult {
     jarCount: number;
     classCount: number;
-    indexPath: string;
     sampleEntries: string[];
     status: 'complete' | 'in_progress';
     progress?: { processed: number; total: number };
@@ -72,7 +71,6 @@ export class DependencyScanner {
                 return {
                     jarCount: index.jarCount,
                     classCount: index.classCount,
-                    indexPath: getProjectCacheDir(projectPath),
                     sampleEntries: index.sampleEntries,
                     status: 'complete',
                 };
@@ -85,7 +83,6 @@ export class DependencyScanner {
             return {
                 jarCount: 0,
                 classCount: 0,
-                indexPath: getProjectCacheDir(projectPath),
                 sampleEntries: [],
                 status: 'in_progress',
                 message: 'Maven classpath is being resolved in the background. This may take a few minutes for large projects (e.g. Spring Boot). Call scan_dependencies again to check progress.',
@@ -104,7 +101,6 @@ export class DependencyScanner {
             return {
                 jarCount: state?.total ?? 0,
                 classCount: 0,
-                indexPath: getProjectCacheDir(projectPath),
                 sampleEntries: [],
                 status: 'in_progress',
                 progress,
@@ -125,7 +121,6 @@ export class DependencyScanner {
             return {
                 jarCount: cachedClasspath.length,
                 classCount: 0,
-                indexPath: getProjectCacheDir(projectPath),
                 sampleEntries: [],
                 status: 'in_progress',
                 progress: { processed: 0, total: cachedClasspath.length },
@@ -141,7 +136,6 @@ export class DependencyScanner {
         return {
             jarCount: 0,
             classCount: 0,
-            indexPath: getProjectCacheDir(projectPath),
             sampleEntries: [],
             status: 'in_progress',
             message: 'Maven classpath resolution started in the background. This may take a few minutes for large projects (e.g. Spring Boot). Call scan_dependencies again to check progress.',

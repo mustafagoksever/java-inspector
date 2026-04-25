@@ -1,3 +1,10 @@
+export interface MethodLineRange {
+    name: string;
+    startLine: number;
+    endLine: number;
+    signature: string;
+}
+
 /**
  * Extract a single method body from Java source code.
  * Handles nested braces, strings, and both line/block comments.
@@ -130,6 +137,120 @@ export function extractMethod(sourceCode: string, methodName: string): string | 
     }
 
     return lines.slice(startIdx, endIdx + 1).join('\n');
+}
+
+/**
+ * Extract all method line ranges from Java source code.
+ */
+export function extractMethodMap(sourceCode: string): MethodLineRange[] {
+    const lines = sourceCode.split('\n');
+    const methods: MethodLineRange[] = [];
+    const modifierRegex = /\b(public|private|protected|static|final|abstract|default|synchronized|native|strictfp)\s/;
+
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const trimmed = line.trim();
+
+        // Match method/constructor signatures
+        if (!modifierRegex.test(trimmed)) continue;
+        const parenOpen = trimmed.indexOf('(');
+        if (parenOpen === -1) continue;
+        const parenClose = trimmed.indexOf(')', parenOpen);
+        if (parenClose === -1) continue;
+
+        // Exclude field initializers like `private static final String FOO = "bar";`
+        const beforeParen = trimmed.substring(0, parenOpen).trim();
+        const lastSpace = beforeParen.lastIndexOf(' ');
+        const name = lastSpace === -1 ? beforeParen : beforeParen.substring(lastSpace + 1).trim();
+        if (!name) continue;
+
+        // Skip if it looks like a field (has `=` before `(` on the same line, or no parens pair)
+        // Actually we already checked parens. Additional: if beforeParen has no type-like token, skip.
+        // Simple heuristic: if name starts with lowercase or is a constructor (same as class), accept.
+        // For now, accept all that pass modifier + ( ) test.
+
+        const startLine = i + 1; // 1-based
+
+        // Find opening brace `{` from startIdx onward
+        let braceIdx = -1;
+        for (let k = i; k < lines.length; k++) {
+            if (lines[k].includes('{')) {
+                braceIdx = k;
+                break;
+            }
+        }
+
+        let endLine = startLine;
+
+        if (braceIdx === -1) {
+            // Abstract method or interface method: collect until semicolon
+            for (let k = i; k < lines.length; k++) {
+                if (lines[k].includes(';')) {
+                    endLine = k + 1;
+                    break;
+                }
+            }
+        } else {
+            // Brace matching from braceIdx onward
+            let depth = 0;
+            let inString = false;
+            let stringChar: string | null = null;
+            let inLineComment = false;
+            let inBlockComment = false;
+            let escaped = false;
+            let foundEnd = false;
+
+            for (let k = braceIdx; k < lines.length; k++) {
+                const l = lines[k];
+                for (let j = 0; j < l.length; j++) {
+                    const ch = l[j];
+
+                    if (inLineComment) {
+                        if (ch === '\n') inLineComment = false;
+                        continue;
+                    }
+                    if (inBlockComment) {
+                        if (ch === '/' && j > 0 && l[j - 1] === '*') inBlockComment = false;
+                        continue;
+                    }
+                    if (inString) {
+                        if (escaped) { escaped = false; continue; }
+                        if (ch === '\\') { escaped = true; continue; }
+                        if (ch === stringChar) { inString = false; stringChar = null; }
+                        continue;
+                    }
+                    if (ch === '"' || ch === "'") {
+                        inString = true;
+                        stringChar = ch;
+                        continue;
+                    }
+                    if (ch === '/' && j < l.length - 1) {
+                        const next = l[j + 1];
+                        if (next === '/') { inLineComment = true; continue; }
+                        if (next === '*') { inBlockComment = true; continue; }
+                    }
+                    if (ch === '{') {
+                        depth++;
+                    } else if (ch === '}') {
+                        depth--;
+                        if (depth === 0) {
+                            endLine = k + 1; // 1-based
+                            foundEnd = true;
+                            break;
+                        }
+                    }
+                }
+                if (foundEnd) break;
+            }
+            if (!foundEnd) {
+                endLine = lines.length;
+            }
+        }
+
+        methods.push({ name, startLine, endLine, signature: trimmed });
+    }
+
+    return methods;
 }
 
 function escapeRegex(str: string): string {

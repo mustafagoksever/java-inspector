@@ -7,7 +7,8 @@ import {
 import { JavaClassAnalyzer } from './analyzer/JavaClassAnalyzer.js';
 import { DependencyScanner } from './scanner/DependencyScanner.js';
 import { DecompilerService } from './decompiler/DecompilerService.js';
-import { extractMethod } from './utils/methodExtractor.js';
+import { extractMethod, extractMethodMap, MethodLineRange } from './utils/methodExtractor.js';
+import { encode as toonEncode } from '@toon-format/toon';
 
 import { fileURLToPath } from 'url';
 import { readFileSync } from 'fs';
@@ -67,8 +68,8 @@ export class JavaClassAnalyzerMCPServer {
                                 },
                                 format: {
                                     type: 'string',
-                                    enum: ['text', 'json'],
-                                    description: 'Output format. Use json for structured machine-readable data.',
+                                    enum: ['text', 'json', 'toon'],
+                                    description: 'Output format. Default is text (human-readable). Use json for structured machine-readable data. Use toon for Token-Oriented Object Notation — a compact, LLM-friendly format that reduces tokens by ~40% compared to JSON while preserving structure (https://github.com/toon-format/toon).',
                                     default: 'text',
                                 },
                             },
@@ -114,8 +115,8 @@ export class JavaClassAnalyzerMCPServer {
                                 },
                                 format: {
                                     type: 'string',
-                                    enum: ['text', 'json'],
-                                    description: 'Output format. Use json for structured machine-readable data.',
+                                    enum: ['text', 'json', 'toon'],
+                                    description: 'Output format. Default is text (human-readable). Use json for structured machine-readable data. Use toon for Token-Oriented Object Notation — a compact, LLM-friendly format that reduces tokens by ~40% compared to JSON while preserving structure (https://github.com/toon-format/toon).',
                                     default: 'text',
                                 },
                             },
@@ -144,8 +145,8 @@ export class JavaClassAnalyzerMCPServer {
                                 },
                                 format: {
                                     type: 'string',
-                                    enum: ['text', 'json'],
-                                    description: 'Output format. Use json for structured machine-readable data.',
+                                    enum: ['text', 'json', 'toon'],
+                                    description: 'Output format. Default is text (human-readable). Use json for structured machine-readable data. Use toon for Token-Oriented Object Notation — a compact, LLM-friendly format that reduces tokens by ~40% compared to JSON while preserving structure (https://github.com/toon-format/toon).',
                                     default: 'text',
                                 },
                             },
@@ -173,8 +174,8 @@ export class JavaClassAnalyzerMCPServer {
                                 },
                                 format: {
                                     type: 'string',
-                                    enum: ['text', 'json'],
-                                    description: 'Output format. Use json for structured machine-readable data.',
+                                    enum: ['text', 'json', 'toon'],
+                                    description: 'Output format. Default is text (human-readable). Use json for structured machine-readable data. Use toon for Token-Oriented Object Notation — a compact, LLM-friendly format that reduces tokens by ~40% compared to JSON while preserving structure (https://github.com/toon-format/toon).',
                                     default: 'text',
                                 },
                             },
@@ -197,8 +198,8 @@ export class JavaClassAnalyzerMCPServer {
                                 },
                                 format: {
                                     type: 'string',
-                                    enum: ['text', 'json'],
-                                    description: 'Output format. Use json for structured machine-readable data.',
+                                    enum: ['text', 'json', 'toon'],
+                                    description: 'Output format. Default is text (human-readable). Use json for structured machine-readable data. Use toon for Token-Oriented Object Notation — a compact, LLM-friendly format that reduces tokens by ~40% compared to JSON while preserving structure (https://github.com/toon-format/toon).',
                                     default: 'text',
                                 },
                             },
@@ -264,6 +265,21 @@ export class JavaClassAnalyzerMCPServer {
         });
     }
 
+    private formatResponse(text: string, structured: object, format: string) {
+        if (format === 'json') {
+            return { structuredContent: structured };
+        }
+        if (format === 'toon') {
+            try {
+                const toonText = toonEncode(structured);
+                return { content: [{ type: 'text', text: toonText }] };
+            } catch {
+                return { content: [{ type: 'text', text }] };
+            }
+        }
+        return { content: [{ type: 'text', text }] };
+    }
+
     private async handleScanDependencies(args: any, sendProgress?: (message: string, progress?: number, total?: number) => Promise<void>) {
         const { projectPath, forceRefresh = false, format = 'text' } = args;
         const logger = Logger.get(projectPath);
@@ -278,25 +294,13 @@ export class JavaClassAnalyzerMCPServer {
 
         if (result.status === 'complete') {
             await sendProgress?.(`Scan complete: ${result.jarCount} JARs, ${result.classCount} classes`, 100, 100);
-            if (format === 'json') {
-                return {
-                    content: [{ type: 'text', text: 'Dependency scanning complete.' }],
-                    structuredContent: {
-                        status: result.status,
-                        jarCount: result.jarCount,
-                        classCount: result.classCount,
-                        indexPath: result.indexPath,
-                    },
-                };
-            }
-            return {
-                content: [
-                    {
-                        type: 'text',
-                        text: `Dependency scanning complete! Indexed ${result.classCount} classes from ${result.jarCount} JARs.`,
-                    },
-                ],
+            const text = `Dependency scanning complete! Indexed ${result.classCount} classes from ${result.jarCount} JARs.`;
+            const structured = {
+                status: result.status,
+                jarCount: result.jarCount,
+                classCount: result.classCount,
             };
+            return this.formatResponse(text, structured, format);
         }
 
         // Background scan in progress
@@ -311,34 +315,20 @@ export class JavaClassAnalyzerMCPServer {
             text += `${result.message}\n\n`;
         }
         text += `Total JARs: ${result.jarCount}\n`;
-        text += `Progress: ${progressText}\n`;
-        text += `Index file path: ${result.indexPath}\n\n`;
+        text += `Progress: ${progressText}\n\n`;
         text += `You can already use \`decompile_class\` and \`analyze_class\` — the server will resolve classes on-demand. `;
         text += `Call \`scan_dependencies\` again later to check progress.`;
 
-        if (format === 'json') {
-            return {
-                content: [{ type: 'text', text: 'Background dependency scan is in progress.' }],
-                structuredContent: {
-                    status: result.status,
-                    jarCount: result.jarCount,
-                    progress: result.progress,
-                    indexPath: result.indexPath,
-                },
-            };
-        }
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text,
-                },
-            ],
+        const structured = {
+            status: result.status,
+            jarCount: result.jarCount,
+            progress: result.progress,
         };
+        return this.formatResponse(text, structured, format);
     }
 
     private async handleDecompileClass(args: any, sendProgress?: (message: string, progress?: number, total?: number) => Promise<void>) {
-        const { className, projectPath, useCache = true, decompilerPath, format = 'text', offset = 1, limit = 0 } = args;
+        const { className, projectPath, useCache = true, decompilerPath, offset = 1, limit = 0, format = 'text' } = args;
         const logger = Logger.get(projectPath);
         const start = performance.now();
         logger.info(`[TOOL:decompile_class] Request: className=${className}, useCache=${useCache}, decompilerPath=${decompilerPath || 'auto-detect'}`);
@@ -357,44 +347,37 @@ export class JavaClassAnalyzerMCPServer {
             await sendProgress?.('Decompilation complete', 100, 100);
 
             if (!sourceCode || sourceCode.trim() === '') {
-                return {
-                    content: [
-                        {
-                            type: 'text',
-                            text: `Warning: Decompilation result for class ${className} is empty, possibly due to Vineflower decompiler issues or corrupted class file`,
-                        },
-                    ],
-                };
+                const text = `Warning: Decompilation result for class ${className} is empty, possibly due to Vineflower decompiler issues or corrupted class file`;
+                const structured = { className, sourceCode: '', totalLines: 0, methods: [] };
+                return this.formatResponse(text, structured, format);
             }
+
+            const totalLines = sourceCode.split('\n').length;
+            const methods = (format === 'json' || format === 'toon') ? extractMethodMap(sourceCode) : [];
 
             // Apply method extraction or offset/limit slicing
             let finalSourceCode = sourceCode;
             let sliceInfo = '';
+            let extractedMethodRange: MethodLineRange | undefined;
 
             if (args.methodName) {
                 const extracted = extractMethod(sourceCode, args.methodName);
                 if (!extracted) {
-                    return {
-                        content: [{
-                            type: 'text',
-                            text: `Method "${args.methodName}" not found in class ${className}.`,
-                        }],
-                    };
+                    const text = `Method "${args.methodName}" not found in class ${className}.`;
+                    const structured = { className, totalLines, methods };
+                    return this.formatResponse(text, structured, format);
                 }
                 finalSourceCode = extracted;
                 sliceInfo = ` (method: ${args.methodName})`;
+                extractedMethodRange = methods.find(m => m.name === args.methodName);
             } else if (offset > 1 || limit > 0) {
                 const lines = sourceCode.split('\n');
-                const totalLines = lines.length;
 
                 const effectiveOffset = offset <= 0 ? 1 : offset;
                 if (effectiveOffset > totalLines) {
-                    return {
-                        content: [{
-                            type: 'text',
-                            text: `Offset ${effectiveOffset} exceeds total lines ${totalLines} for class ${className}.`,
-                        }],
-                    };
+                    const text = `Offset ${effectiveOffset} exceeds total lines ${totalLines} for class ${className}.`;
+                    const structured = { className, totalLines, methods };
+                    return this.formatResponse(text, structured, format);
                 }
 
                 const effectiveLimit = limit < 0 ? 0 : limit;
@@ -409,33 +392,31 @@ export class JavaClassAnalyzerMCPServer {
 
             const duration = ((performance.now() - start) / 1000).toFixed(2);
             logger.info(`[TOOL:decompile_class] Complete in ${duration}s. Source length: ${sourceCode.length} chars.`);
-            if (format === 'json') {
-                return {
-                    content: [{ type: 'text', text: `Decompiled ${className}${sliceInfo}` }],
-                    structuredContent: { className, sourceCode: finalSourceCode },
+
+            const text = `Decompiled source code for class ${className}${sliceInfo}:\n\n\`\`\`java\n${finalSourceCode}\n\`\`\``;
+
+            const structured: any = {
+                className,
+                totalLines,
+                sourceCode: finalSourceCode,
+                methods,
+            };
+            if (extractedMethodRange) {
+                structured.extractedMethod = {
+                    name: extractedMethodRange.name,
+                    startLine: extractedMethodRange.startLine,
+                    endLine: extractedMethodRange.endLine,
                 };
             }
-            return {
-                content: [
-                    {
-                        type: 'text',
-                        text: `Decompiled source code for class ${className}${sliceInfo}:\n\n\`\`\`java\n${finalSourceCode}\n\`\`\``,
-                    },
-                ],
-            };
+            return this.formatResponse(text, structured, format);
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : String(error);
             const duration = ((performance.now() - start) / 1000).toFixed(2);
             logger.error(`[TOOL:decompile_class] Failed after ${duration}s: ${errorMessage}`);
             await sendProgress?.(`Decompilation failed: ${errorMessage}`);
-            return {
-                content: [
-                    {
-                        type: 'text',
-                        text: `Decompilation failed: ${errorMessage}`,
-                    },
-                ],
-            };
+            const text = `Decompilation failed: ${errorMessage}`;
+            const structured = { className, error: errorMessage };
+            return this.formatResponse(text, structured, format);
         }
     }
 
@@ -461,52 +442,39 @@ export class JavaClassAnalyzerMCPServer {
 
         const { fields, methods } = this.applyFilter(analysis, filter);
 
-        if (format === 'json') {
-            return {
-                content: [{ type: 'text', text: `Analyzed ${className}` }],
-                structuredContent: {
-                    className: analysis.className,
-                    packageName: analysis.packageName,
-                    modifiers: analysis.modifiers,
-                    superClass: analysis.superClass,
-                    interfaces: analysis.interfaces,
-                    fields,
-                    methods,
-                },
-            };
-        }
-
-        let result = `Analysis result for class ${className}:\n\n`;
-        result += `Package name: ${analysis.packageName}\n`;
-        result += `Class name: ${analysis.className}\n`;
-        result += `Modifiers: ${analysis.modifiers.join(' ')}\n`;
-        result += `Super class: ${analysis.superClass || 'None'}\n`;
-        result += `Implemented interfaces: ${analysis.interfaces.join(', ') || 'None'}\n\n`;
+        let text = `Analysis result for class ${className}:\n\n`;
+        text += `Package name: ${analysis.packageName}\n`;
+        text += `Class name: ${analysis.className}\n`;
+        text += `Modifiers: ${analysis.modifiers.join(' ')}\n`;
+        text += `Super class: ${analysis.superClass || 'None'}\n`;
+        text += `Implemented interfaces: ${analysis.interfaces.join(', ') || 'None'}\n\n`;
 
         if (fields.length > 0) {
-            result += `Fields (${fields.length}):\n`;
+            text += `Fields (${fields.length}):\n`;
             fields.forEach(field => {
-                result += `  - ${field.modifiers.join(' ')} ${field.type} ${field.name}\n`;
+                text += `  - ${field.modifiers.join(' ')} ${field.type} ${field.name}\n`;
             });
-            result += '\n';
+            text += '\n';
         }
 
         if (methods.length > 0) {
-            result += `Methods (${methods.length}):\n`;
+            text += `Methods (${methods.length}):\n`;
             methods.forEach(method => {
-                result += `  - ${method.modifiers.join(' ')} ${method.returnType} ${method.name}(${method.parameters.join(', ')})\n`;
+                text += `  - ${method.modifiers.join(' ')} ${method.returnType} ${method.name}(${method.parameters.join(', ')})\n`;
             });
-            result += '\n';
+            text += '\n';
         }
 
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: result,
-                },
-            ],
+        const structured = {
+            className: analysis.className,
+            packageName: analysis.packageName,
+            modifiers: analysis.modifiers,
+            superClass: analysis.superClass,
+            interfaces: analysis.interfaces,
+            fields,
+            methods,
         };
+        return this.formatResponse(text, structured, format);
     }
 
     private async handleSearchClass(args: any, sendProgress?: (message: string, progress?: number, total?: number) => Promise<void>) {
@@ -526,44 +494,14 @@ export class JavaClassAnalyzerMCPServer {
 
         await sendProgress?.(`Found ${results.length} matches`, 100, 100);
 
-        if (results.length === 0) {
-            if (format === 'json') {
-                return {
-                    content: [{ type: 'text', text: `No classes found matching "${query}".` }],
-                    structuredContent: { query, results: [], isComplete: await this.scanner.isIndexComplete(projectPath) },
-                };
-            }
-            return {
-                content: [
-                    {
-                        type: 'text',
-                        text: `No classes found matching "${query}".\n\nSuggestions:\n1. Check your spelling\n2. Run scan_dependencies first if you haven't already\n3. Try a broader query (e.g. "Repository" instead of "JpaRepository")`,
-                    },
-                ],
-            };
-        }
-
         const isComplete = await this.scanner.isIndexComplete(projectPath);
         const scanProgress = isComplete ? undefined : await this.scanner.getScanProgress(projectPath);
         const pct = scanProgress ? Math.floor((scanProgress.processed / scanProgress.total) * 100) : undefined;
 
-        if (format === 'json') {
-            return {
-                content: [{ type: 'text', text: `Found ${results.length} matches.` }],
-                structuredContent: {
-                    query,
-                    results: results.map((r: any) => ({
-                        className: `${r.packageName}.${r.simpleName}`,
-                        packageName: r.packageName,
-                        simpleName: r.simpleName,
-                        jarPath: r.jarPath,
-                        jarName: path.basename(r.jarPath),
-                        score: r.score,
-                    })),
-                    isComplete,
-                    scanProgressPct: pct,
-                },
-            };
+        if (results.length === 0) {
+            const text = `No classes found matching "${query}".\n\nSuggestions:\n1. Check your spelling\n2. Run scan_dependencies first if you haven't already\n3. Try a broader query (e.g. "Repository" instead of "JpaRepository")`;
+            const structured = { query, results: [], isComplete, scanProgressPct: pct };
+            return this.formatResponse(text, structured, format);
         }
 
         let text = `Found ${results.length} class(es) matching "${query}":\n\n`;
@@ -578,14 +516,19 @@ export class JavaClassAnalyzerMCPServer {
             text += `\n\n_Note: Background dependency scan is ${pct}% complete. Results may be partial._`;
         }
 
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text,
-                },
-            ],
+        const structured = {
+            query,
+            results: results.map((r: any) => ({
+                className: `${r.packageName}.${r.simpleName}`,
+                packageName: r.packageName,
+                simpleName: r.simpleName,
+                jarName: path.basename(r.jarPath),
+                score: r.score,
+            })),
+            isComplete,
+            scanProgressPct: pct,
         };
+        return this.formatResponse(text, structured, format);
     }
 
     private async handleGetInheritanceTree(args: any, sendProgress?: (message: string, progress?: number, total?: number) => Promise<void>) {
@@ -605,32 +548,26 @@ export class JavaClassAnalyzerMCPServer {
 
         await sendProgress?.('Hierarchy complete', 100, 100);
 
-        if (format === 'json') {
-            return {
-                content: [{ type: 'text', text: `Inheritance hierarchy for ${className}` }],
-                structuredContent: { className, hierarchy },
-            };
-        }
-
         let text = `Inheritance hierarchy for \`${className}\`:\n\n`;
-        hierarchy.forEach((cls, idx) => {
+        hierarchy.forEach((entry, idx) => {
             const indent = '  '.repeat(idx);
             const arrow = idx === 0 ? '' : '▸ ';
-            text += `${indent}${arrow}\`${cls}\`\n`;
+            text += `${indent}${arrow}\`${entry.className}\`${entry.resolved ? '' : ' (not in indexed dependencies)'}\n`;
         });
 
         if (hierarchy.length === 1) {
             text += '\n(This class has no superclass in the indexed dependencies; it likely extends java.lang.Object or a JDK class not present in the Maven dependencies.)';
         }
 
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text,
-                },
-            ],
+        const structured = {
+            className,
+            hierarchy: hierarchy.map(entry => ({
+                className: entry.className,
+                level: entry.level,
+                resolved: entry.resolved,
+            })),
         };
+        return this.formatResponse(text, structured, format);
     }
 
     private applyFilter(
