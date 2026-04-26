@@ -176,26 +176,7 @@ sequenceDiagram
     A-->>U: Formatted response
 ```
 
----
 
-## Performance
-
-Real numbers from a **Spring Boot + Vaadin** project (144 dependencies, 17,405 classes):
-
-| Phase | Cold start | Warm cache |
-|-------|-----------|------------|
-| Maven classpath resolve | 5–10 s | — |
-| Background JAR index | 20–30 s | — |
-| Per-class lookup | 2–5 s | **< 1 ms** |
-| Fuzzy search | — | **~30 ms** |
-| Vineflower decompile (first) | ~2 s | — |
-| Vineflower decompile (cached) | — | **< 100 ms** |
-
-**First tool call** lands in ~10 seconds (classpath resolve + scan kickoff). **Everything after that** is effectively instant.
-
-**Multi-process safety**: Two-tier cross-process locking via `proper-lockfile` ensures that if multiple MCP server instances target the same project, only one scan runs at a time. The other instances receive a graceful `in_progress` response instead of duplicating work.
-
----
 
 ## Cache invalidation
 
@@ -334,7 +315,7 @@ Log files are **cleared when cache is invalidated** (`forceRefresh: true` or has
 
 ---
 
-## 9. Performance Test Results
+## Performance Test Results
 
 ### Spring AI Project Test (April 2026)
 
