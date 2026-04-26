@@ -142,6 +142,87 @@ describe('extractMethod', () => {
         expect(result).toContain('public List<String> getList()');
         expect(result).toContain('return new ArrayList<>();');
     });
+
+    it('should return all overloads when paramTypes is not provided', () => {
+        const source = `public class Foo {
+    public int add(int a, int b) {
+        return a + b;
+    }
+    public String add(String a, String b) {
+        return a + b;
+    }
+}`;
+        const result = extractMethod(source, 'add');
+        expect(result).toContain('int a, int b');
+        expect(result).toContain('String a, String b');
+        expect(result).toContain('// ===== Method Overload =====');
+    });
+
+    it('should filter by paramTypes to select specific overload', () => {
+        const source = `public class Foo {
+    public int add(int a, int b) {
+        return a + b;
+    }
+    public String add(String a, String b) {
+        return a + b;
+    }
+}`;
+        const result1 = extractMethod(source, 'add', ['int', 'int']);
+        expect(result1).toContain('int a, int b');
+        expect(result1).not.toContain('String a, String b');
+
+        const result2 = extractMethod(source, 'add', ['String', 'String']);
+        expect(result2).toContain('String a, String b');
+        expect(result2).not.toContain('int a, int b');
+    });
+
+    it('should handle generic types in paramTypes', () => {
+        const source = `public class Foo {
+    public void process(List<String> items) {
+        System.out.println(items);
+    }
+    public void process(List<Integer> numbers) {
+        System.out.println(numbers);
+    }
+}`;
+        const result1 = extractMethod(source, 'process', ['List<String>']);
+        expect(result1).toContain('List<String> items');
+
+        const result2 = extractMethod(source, 'process', ['List<Integer>']);
+        expect(result2).toContain('List<Integer> numbers');
+    });
+
+    it('should handle final modifier in paramTypes', () => {
+        const source = `public class Foo {
+    public void doSomething(final String value) {
+        System.out.println(value);
+    }
+    public void doSomething(int value) {
+        System.out.println(value);
+    }
+}`;
+        const result1 = extractMethod(source, 'doSomething', ['String']);
+        expect(result1).toContain('final String value');
+
+        const result2 = extractMethod(source, 'doSomething', ['int']);
+        expect(result2).toContain('int value');
+    });
+
+    it('should handle array types in paramTypes', () => {
+        const source = `public class Foo {
+    public void handle(String[] items) {
+        System.out.println(items);
+    }
+    public void handle(int[] numbers) {
+        System.out.println(numbers);
+    }
+}`;
+        const result1 = extractMethod(source, 'handle', ['String[]']);
+        expect(result1).toContain('String[] items');
+
+        const result2 = extractMethod(source, 'handle', ['int[]']);
+        expect(result2).toContain('int[] numbers');
+    });
 });
 
 describe('extractMethodMap', () => {

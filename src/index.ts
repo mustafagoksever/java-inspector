@@ -7,7 +7,7 @@ import {
 import { JavaClassAnalyzer } from './analyzer/JavaClassAnalyzer.js';
 import { DependencyScanner } from './scanner/DependencyScanner.js';
 import { DecompilerService } from './decompiler/DecompilerService.js';
-import { extractMethod, extractMethodMap, MethodLineRange } from './utils/methodExtractor.js';
+import { extractMethod, extractMethodMap, extractParamTypes, matchParamTypes, MethodLineRange } from './utils/methodExtractor.js';
 import { encode as toonEncode } from '@toon-format/toon';
 
 import { fileURLToPath } from 'url';
@@ -102,6 +102,11 @@ export class JavaClassAnalyzerMCPServer {
                                 methodName: {
                                     type: 'string',
                                     description: 'Optional method name to extract instead of the full class. When provided, only the method body is returned.',
+                                },
+                                paramTypes: {
+                                    type: 'array',
+                                    items: { type: 'string' },
+                                    description: 'Optional: filter method overloads by parameter types (e.g. ["String", "int"]). Use when multiple methods with the same name exist.',
                                 },
                                 offset: {
                                     type: 'number',
@@ -328,7 +333,7 @@ export class JavaClassAnalyzerMCPServer {
     }
 
     private async handleDecompileClass(args: any, sendProgress?: (message: string, progress?: number, total?: number) => Promise<void>) {
-        const { className, projectPath, useCache = true, decompilerPath, offset = 1, limit = 0, format = 'text' } = args;
+        const { className, projectPath, useCache = true, decompilerPath, offset = 1, limit = 0, format = 'text', methodName, paramTypes } = args;
         const logger = Logger.get(projectPath);
         const start = performance.now();
         logger.info(`[TOOL:decompile_class] Request: className=${className}, useCache=${useCache}, decompilerPath=${decompilerPath || 'auto-detect'}`);
@@ -360,16 +365,21 @@ export class JavaClassAnalyzerMCPServer {
             let sliceInfo = '';
             let extractedMethodRange: MethodLineRange | undefined;
 
-            if (args.methodName) {
-                const extracted = extractMethod(sourceCode, args.methodName);
+            if (methodName) {
+                const extracted = extractMethod(sourceCode, methodName, paramTypes);
                 if (!extracted) {
-                    const text = `Method "${args.methodName}" not found in class ${className}.`;
-                    const structured = { className, totalLines, methods };
+                    const text = `Method "${methodName}" not found in class ${className}${paramTypes ? ' with paramTypes ' + JSON.stringify(paramTypes) : ''}.`;
+                    const structured = { className, totalLines, methods, methodName, paramTypes };
                     return this.formatResponse(text, structured, format);
                 }
                 finalSourceCode = extracted;
-                sliceInfo = ` (method: ${args.methodName})`;
-                extractedMethodRange = methods.find(m => m.name === args.methodName);
+                sliceInfo = ` (method: ${methodName}${paramTypes ? ' ' + JSON.stringify(paramTypes) : ''})`;
+                extractedMethodRange = methods.find(m => {
+                    if (m.name !== methodName) return false;
+                    if (!paramTypes || paramTypes.length === 0) return true;
+                    const sigParams = extractParamTypes(m.signature);
+                    return matchParamTypes(sigParams, paramTypes);
+                });
             } else if (offset > 1 || limit > 0) {
                 const lines = sourceCode.split('\n');
 
