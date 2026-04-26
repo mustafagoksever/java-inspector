@@ -116,17 +116,12 @@ Edit `%APPDATA%\Claude\claude_desktop_config.json`:
 
 ### Codex
 
-Edit `%APPDATA%\Codex\config.json`:
+Edit `~/.codex/config.toml`:
 
-```json
-{
-  "mcpServers": {
-    "java-inspector": {
-      "command": "npx",
-      "args": ["-y", "@mustafagoksever/java-inspector"]
-    }
-  }
-}
+```toml
+[mcp_servers.java-inspector]
+command = "npx"
+args = ["-y", "@mustafagoksever/java-inspector"]
 ```
 
 ### Opencode
