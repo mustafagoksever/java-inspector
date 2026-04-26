@@ -408,13 +408,14 @@ export class DependencyScanner {
             return this.mavenCommand;
         }
 
-        // 2. Try mvnd (Maven Daemon)
+        // 2. Try mvnd (Maven Daemon) via PATH lookup (~50ms vs ~2-3s with --version)
         const mvndStart = performance.now();
         try {
-            await execFileAsync('mvnd', ['--version'], { timeout: 5000, shell: process.platform === 'win32' });
+            const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+            await execFileAsync(whichCmd, ['mvnd'], { timeout: 2000, shell: process.platform === 'win32' });
             const mvndDuration = (performance.now() - mvndStart).toFixed(0);
             this.mavenCommand = 'mvnd';
-            logger.info(`[MAVEN] mvnd detected in ${mvndDuration}ms. Selected: mvnd`);
+            logger.info(`[MAVEN] mvnd detected via ${whichCmd} in ${mvndDuration}ms. Selected: mvnd`);
             return 'mvnd';
         } catch {
             const mvndDuration = (performance.now() - mvndStart).toFixed(0);
