@@ -334,6 +334,28 @@ Log files are **cleared when cache is invalidated** (`forceRefresh: true` or has
 
 ---
 
+## 9. Performance Test Results
+
+### Spring AI Project Test (April 2026)
+
+**Test Environment:** Windows, Maven Daemon (`mvnd`)
+**Project:** Spring AI (multi-module project)
+**Module:** spring-ai-weaviate-store (submodule)
+
+| Operation | Time |
+|-----------|------|
+| Maven classpath resolution (185 JARs) | 44.87s |
+| Background scan (185 JARs, 30,612 classes) | 12.38s |
+| Total initial scan | ~57s |
+| analyze_class (UserMessage) | <1s |
+| decompile_class (UserMessage) | <1s |
+| search_class (query: "UserMessage") | <1s |
+
+**Notes:**
+- First call triggers classpath resolution + background scan (non-blocking)
+- Subsequent calls use cached index (in-memory Map)
+- Cross-process locking prevents duplicate scans
+
 ## License
 
 Apache-2.0
