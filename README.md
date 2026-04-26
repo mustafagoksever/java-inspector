@@ -321,7 +321,6 @@ Log files are **cleared when cache is invalidated** (`forceRefresh: true` or has
 
 **Test Environment:** Windows, Maven Daemon (`mvnd`)
 **Project:** Spring AI (multi-module project)
-**Module:** spring-ai-weaviate-store (submodule)
 
 | Operation | Time |
 |-----------|------|
