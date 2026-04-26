@@ -135,10 +135,22 @@ Edit `%APPDATA%\opencode\config.json`:
 
 ```json
 {
-  "mcpServers": {
+  "mcp": {
+    "devtools": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "chrome-devtools-mcp@latest"
+      ]
+    },
     "java-inspector": {
-      "command": "npx",
-      "args": ["-y", "@mustafagoksever/java-inspector"]
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "@mustafagoksever/java-inspector"
+      ]
     }
   }
 }
