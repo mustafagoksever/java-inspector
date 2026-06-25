@@ -303,14 +303,12 @@ describe('DecompilerService', () => {
     describe('decompileWithVineflower', () => {
         it('should throw when decompilerPath is empty', async () => {
             const s = new DecompilerService();
-            (s as any).decompilerPath = '';
-            await expect((s as any).decompileWithVineflower('/tmp/Test.class', 'com.example.Test', projectPath))
+            await expect((s as any).decompileWithVineflower('/tmp/Test.class', 'com.example.Test', projectPath, ''))
                 .rejects.toThrow('Vineflower decompiler tool not found');
         });
 
         it('should return source when decompilation succeeds', async () => {
             const s = new DecompilerService();
-            (s as any).decompilerPath = '/fake/vineflower.jar';
 
             const mockExecFile = await getMockExecFile();
             mockExecFile.mockImplementation(((cmd: string, args: string[], options: any, callback: any) => {
@@ -326,13 +324,12 @@ describe('DecompilerService', () => {
                 return undefined as any;
             }) as any);
 
-            const result = await (s as any).decompileWithVineflower('/tmp/Test.class', 'com.example.Test', projectPath);
+            const result = await (s as any).decompileWithVineflower('/tmp/Test.class', 'com.example.Test', projectPath, '/fake/vineflower.jar');
             expect(result).toBe('public class TestClass {}');
         });
 
         it('should throw when Vineflower output file is missing', async () => {
             const s = new DecompilerService();
-            (s as any).decompilerPath = '/fake/vineflower.jar';
 
             const mockExecFile = await getMockExecFile();
             mockExecFile.mockImplementation(((cmd: string, args: string[], options: any, callback: any) => {
@@ -342,13 +339,12 @@ describe('DecompilerService', () => {
                 return undefined as any;
             }) as any);
 
-            await expect((s as any).decompileWithVineflower('/tmp/Test.class', 'com.example.Test', projectPath))
+            await expect((s as any).decompileWithVineflower('/tmp/Test.class', 'com.example.Test', projectPath, '/fake/vineflower.jar'))
                 .rejects.toThrow('Vineflower did not produce expected output file');
         });
 
         it('should throw when Vineflower returns empty source', async () => {
             const s = new DecompilerService();
-            (s as any).decompilerPath = '/fake/vineflower.jar';
 
             const mockExecFile = await getMockExecFile();
             mockExecFile.mockImplementation(((cmd: string, args: string[], options: any, callback: any) => {
@@ -364,13 +360,12 @@ describe('DecompilerService', () => {
                 return undefined as any;
             }) as any);
 
-            await expect((s as any).decompileWithVineflower('/tmp/Test.class', 'com.example.Test', projectPath))
+            await expect((s as any).decompileWithVineflower('/tmp/Test.class', 'com.example.Test', projectPath, '/fake/vineflower.jar'))
                 .rejects.toThrow('Vineflower decompilation returned empty result');
         });
 
         it('should propagate stderr errors', async () => {
             const s = new DecompilerService();
-            (s as any).decompilerPath = '/fake/vineflower.jar';
 
             const mockExecFile = await getMockExecFile();
             mockExecFile.mockImplementation(((cmd: string, args: string[], options: any, callback: any) => {
@@ -389,7 +384,7 @@ describe('DecompilerService', () => {
             fs.writeFileSync(outputFile, 'public class Test {}', 'utf-8');
 
             try {
-                await (s as any).decompileWithVineflower('/tmp/Test.class', 'com.example.Test', projectPath, logger);
+                await (s as any).decompileWithVineflower('/tmp/Test.class', 'com.example.Test', projectPath, '/fake/vineflower.jar', logger);
             } catch {
                 // ignore
             }
