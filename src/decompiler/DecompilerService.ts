@@ -90,6 +90,8 @@ export class DecompilerService {
                 await fs.ensureDir(path.dirname(cachePath));
                 await fs.outputFile(cachePath, sourceCode, 'utf-8');
                 logger.debug(`[DECOMPILE] Cached result: ${cachePath}`);
+                // Evict old cache files if total exceeds 500MB
+                this.evictOldCacheFiles(projectPath).catch(() => {});
             }
 
             // 6. Clean up temporary .class file (always, since decompiler only reads it)
@@ -357,5 +359,44 @@ export class DecompilerService {
         }
         logger?.debug(`[DECOMPILE] JAVA_HOME not set, falling back to 'java' in PATH`);
         return 'java'; // Fallback to java in PATH
+    }
+
+    /**
+     * Evict oldest cache files if total size exceeds maxSizeBytes.
+     * Call after writing to cache to prevent unbounded disk growth.
+     */
+    async evictOldCacheFiles(projectPath: string, maxSizeBytes: number = 500 * 1024 * 1024): Promise<void> {
+        const cacheDir = getDecompileCacheDir(projectPath);
+        try {
+            const exists = await fs.pathExists(cacheDir);
+            if (!exists) return;
+
+            const files = await fs.readdir(cacheDir);
+            if (files.length === 0) return;
+
+            let totalSize = 0;
+            const fileStats: { name: string; size: number; mtime: Date }[] = [];
+
+            for (const file of files) {
+                const filePath = path.join(cacheDir, file);
+                const stat = await fs.stat(filePath);
+                if (stat.isFile()) {
+                    totalSize += stat.size;
+                    fileStats.push({ name: file, size: stat.size, mtime: stat.mtime });
+                }
+            }
+
+            if (totalSize <= maxSizeBytes) return;
+
+            // Sort oldest first, evict until under limit
+            fileStats.sort((a, b) => a.mtime.getTime() - b.mtime.getTime());
+            for (const file of fileStats) {
+                if (totalSize <= maxSizeBytes * 0.8) break;
+                await fs.remove(path.join(cacheDir, file.name)).catch(() => {});
+                totalSize -= file.size;
+            }
+        } catch {
+            // ignore cleanup errors
+        }
     }
 }

@@ -30,18 +30,6 @@ program
     });
 
 program
-    .command('test')
-    .description('Test MCP server functionality')
-    .option('-p, --project <path>', 'Maven project path')
-    .option('-c, --class <className>', 'Class name to test')
-    .option('--no-cache', 'Do not use cache')
-    .option('--decompiler-path <path>', 'Vineflower decompiler JAR path')
-    .action(async (options) => {
-console.log('Test mode - please use test-tools.js for complete testing');
-        console.log('Run: node test-tools.js --help for detailed usage');
-    });
-
-program
     .command('config')
     .description('Generate MCP client configuration example')
     .option('-o, --output <file>', 'Output configuration file path', 'mcp-client-config.json')

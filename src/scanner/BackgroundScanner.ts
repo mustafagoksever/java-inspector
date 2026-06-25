@@ -125,7 +125,7 @@ export class BackgroundScanner {
             await projectCache.appendToClassIndex(
                 projectPath,
                 batchClasses,
-                Array.from(processedJars),
+                batch,
                 jarPaths.length
             );
 

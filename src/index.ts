@@ -265,6 +265,7 @@ export class JavaClassAnalyzerMCPServer {
                             text: `Tool call failed: ${errorMessage}`,
                         },
                     ],
+                    isError: true,
                 };
             }
         });
@@ -312,7 +313,7 @@ export class JavaClassAnalyzerMCPServer {
         const progressText = result.progress
             ? `${result.progress.processed}/${result.progress.total} JARs processed`
             : 'starting...';
-        const progressPct = result.progress ? Math.floor((result.progress.processed / result.progress.total) * 100) : 0;
+        const progressPct = result.progress && result.progress.total > 0 ? Math.floor((result.progress.processed / result.progress.total) * 100) : 0;
         await sendProgress?.(`Background scan in progress: ${progressText}`, progressPct, 100);
 
         let text = `Background dependency scan is in progress.\n\n`;

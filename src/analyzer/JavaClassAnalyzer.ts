@@ -37,6 +37,7 @@ export interface HierarchyEntry {
 
 export class JavaClassAnalyzer {
     private scanner: DependencyScanner;
+    private superClassCache = new Map<string, string | undefined>();
 
     constructor() {
         this.scanner = DependencyScanner.getInstance();
@@ -73,35 +74,6 @@ export class JavaClassAnalyzer {
             logger.error(`[JAVAP] Failed after ${duration}s: ${error instanceof Error ? error.message : String(error)}`);
             throw error;
         }
-    }
-
-    /**
-     * Run async tasks with a concurrency limit.
-     */
-    private async runWithConcurrencyLimit<T>(
-        items: T[],
-        concurrency: number,
-        fn: (item: T) => Promise<void>
-    ): Promise<void> {
-        let index = 0;
-        const workers: Promise<void>[] = [];
-
-        const worker = async (): Promise<void> => {
-            while (index < items.length) {
-                const currentIndex = index++;
-                try {
-                    await fn(items[currentIndex]);
-                } catch {
-                    // fn is expected to handle its own errors; swallow here
-                }
-            }
-        };
-
-        for (let i = 0; i < Math.min(concurrency, items.length); i++) {
-            workers.push(worker());
-        }
-
-        await Promise.all(workers);
     }
 
     /**
@@ -411,18 +383,29 @@ export class JavaClassAnalyzer {
         const hierarchy: HierarchyEntry[] = [];
         let currentName = className;
         let level = 0;
+        const visited = new Set<string>();
+        const MAX_DEPTH = 20;
 
-        while (currentName) {
+        while (currentName && level < MAX_DEPTH) {
+            if (visited.has(currentName)) break;
+            visited.add(currentName);
             let resolved = false;
             let superClass: string | undefined;
 
-            try {
-                const analysis = await this.analyzeClass(currentName, projectPath, false);
+            const cached = this.superClassCache.get(currentName);
+            if (cached !== undefined) {
+                superClass = cached;
                 resolved = true;
-                superClass = analysis.superClass;
-            } catch {
-                // Class not found in indexed dependencies
-                resolved = false;
+            } else {
+                try {
+                    const analysis = await this.analyzeClass(currentName, projectPath, false);
+                    resolved = true;
+                    superClass = analysis.superClass;
+                    this.superClassCache.set(currentName, superClass);
+                } catch {
+                    // Class not found in indexed dependencies
+                    resolved = false;
+                }
             }
 
             hierarchy.unshift({ className: currentName, level: 0, resolved });
