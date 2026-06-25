@@ -184,22 +184,24 @@ describe('JavaClassAnalyzerMCPServer', () => {
     describe('logToolDebug', () => {
         it('should not log in production mode', () => {
             process.env.NODE_ENV = 'production';
-            const logger = Logger.get(createTestProject());
+            const projectPath = createTestProject();
+            const logger = Logger.get(projectPath);
             const spy = jest.spyOn(logger, 'debug').mockImplementation(() => {});
             (server as any).logToolDebug(logger, 'test_tool', '/tmp/project', { extra: true });
             expect(spy).not.toHaveBeenCalled();
             spy.mockRestore();
-            Logger.clearLog(logger as any);
+            Logger.clearLog(projectPath);
         });
 
         it('should log in development mode', () => {
             process.env.NODE_ENV = 'development';
-            const logger = Logger.get(createTestProject());
+            const projectPath = createTestProject();
+            const logger = Logger.get(projectPath);
             const spy = jest.spyOn(logger, 'debug').mockImplementation(() => {});
             (server as any).logToolDebug(logger, 'test_tool', '/tmp/project', { extra: true });
             expect(spy).toHaveBeenCalled();
             spy.mockRestore();
-            Logger.clearLog(logger as any);
+            Logger.clearLog(projectPath);
         });
     });
 

@@ -24,6 +24,7 @@ export class DependencyScanner {
     private static instance: DependencyScanner;
     private classpathPromises = new Map<string, Promise<string[]>>();
     private mavenCommand: string | null = null;
+    private scanErrors = new Map<string, string>();
     // Track scan.lock release functions so we can release when scan completes
     private scanLockReleases = new Map<string, () => Promise<void>>();
 
@@ -63,12 +64,26 @@ export class DependencyScanner {
             await projectCache.invalidate(projectPath);
             backgroundScanner.reset(projectPath);
             this.classpathPromises.delete(projectPath);
+            this.scanErrors.delete(projectPath);
             // Release any stale scan lock held by this process
             const existingRelease = this.scanLockReleases.get(projectPath);
             if (existingRelease) {
                 try { await existingRelease(); } catch { /* ignore */ }
                 this.scanLockReleases.delete(projectPath);
             }
+        }
+
+        // Check for stored scan errors
+        const storedError = this.scanErrors.get(projectPath);
+        if (storedError) {
+            this.scanErrors.delete(projectPath);
+            return {
+                jarCount: 0,
+                classCount: 0,
+                sampleEntries: [],
+                status: 'in_progress' as const,
+                message: `Previous scan failed: ${storedError}. Call scan_dependencies with forceRefresh=true to retry.`,
+            };
         }
 
         // Check for complete index
@@ -163,6 +178,8 @@ export class DependencyScanner {
         // Start classpath resolution in the background (non-blocking)
         await onProgress?.('Starting Maven classpath resolution in background...', 5, 100);
         this.resolveClasspathAndStartScan(projectPath, onProgress).catch((error) => {
+            const msg = error instanceof Error ? error.message : String(error);
+            this.scanErrors.set(projectPath, msg);
             console.error('Background classpath resolution failed:', error);
         });
 
@@ -201,7 +218,9 @@ export class DependencyScanner {
                     logger.info('[SCAN] Scan completed, releasing cross-process lock.');
                 })
                 .catch((err) => {
-                    logger.error(`[SCAN] Scan failed: ${err instanceof Error ? err.message : String(err)}`);
+                    const msg = err instanceof Error ? err.message : String(err);
+                    this.scanErrors.set(projectPath, msg);
+                    logger.error(`[SCAN] Scan failed: ${msg}`);
                 })
                 .finally(async () => {
                     try { await release(); } catch { /* ignore */ }
@@ -403,6 +422,9 @@ export class DependencyScanner {
 
         // 1. Explicit override via env var
         if (process.env.MAVEN_CMD) {
+            if (/[&|;<>$()]/.test(process.env.MAVEN_CMD)) {
+                throw new Error(`Invalid MAVEN_CMD: Shell metacharacters are not allowed to prevent command injection.`);
+            }
             this.mavenCommand = process.env.MAVEN_CMD;
             logger.info(`[MAVEN] Using MAVEN_CMD override: ${this.mavenCommand}`);
             return this.mavenCommand;

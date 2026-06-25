@@ -334,6 +334,9 @@ export class JavaClassAnalyzerMCPServer {
 
     private async handleDecompileClass(args: any, sendProgress?: (message: string, progress?: number, total?: number) => Promise<void>) {
         const { className, projectPath, useCache = true, decompilerPath, offset = 1, limit = 0, format = 'text', methodName, paramTypes } = args;
+        
+        this.validateClassName(className);
+
         const logger = Logger.get(projectPath);
         const start = performance.now();
         logger.info(`[TOOL:decompile_class] Request: className=${className}, useCache=${useCache}, decompilerPath=${decompilerPath || 'auto-detect'}`);
@@ -432,6 +435,9 @@ export class JavaClassAnalyzerMCPServer {
 
     private async handleAnalyzeClass(args: any, sendProgress?: (message: string, progress?: number, total?: number) => Promise<void>) {
         const { className, projectPath, filter = 'all', format = 'text' } = args;
+        
+        this.validateClassName(className);
+
         const logger = Logger.get(projectPath);
         const start = performance.now();
         logger.info(`[TOOL:analyze_class] Request: className=${className}, filter=${filter}`);
@@ -543,6 +549,9 @@ export class JavaClassAnalyzerMCPServer {
 
     private async handleGetInheritanceTree(args: any, sendProgress?: (message: string, progress?: number, total?: number) => Promise<void>) {
         const { className, projectPath, format = 'text' } = args;
+        
+        this.validateClassName(className);
+
         const logger = Logger.get(projectPath);
         const start = performance.now();
         logger.info(`[TOOL:get_inheritance_tree] Request: className=${className}`);
@@ -599,7 +608,20 @@ export class JavaClassAnalyzerMCPServer {
         return { fields, methods };
     }
 
-/**
+    private validateClassName(className: string): void {
+        if (!className || typeof className !== 'string') {
+            throw new Error('className is required and must be a string.');
+        }
+        if (className.includes('/') || className.includes('\\') || className.includes('..')) {
+            throw new Error(`Invalid className: Path traversal sequences are not allowed.`);
+        }
+        const javaFqcnPattern = /^[a-zA-Z_$][a-zA-Z0-9_$]*(\.[a-zA-Z_$][a-zA-Z0-9_$]*)*$/;
+        if (!javaFqcnPattern.test(className)) {
+            throw new Error(`Invalid className: Must be a valid Java fully qualified class name.`);
+        }
+    }
+
+    /**
      * Validate that projectPath is a valid Maven project root.
      */
     private async validateProjectPath(projectPath: string): Promise<void> {
