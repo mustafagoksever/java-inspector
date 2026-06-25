@@ -192,36 +192,52 @@ export class LazyResolver {
         const suffix = '/' + simpleName + '.class';
 
         return new Promise((resolve, reject) => {
+            let zipfile: any = null;
+            let settled = false;
+
             const timer = setTimeout(() => {
-                reject(new Error(`Timeout reading JAR: ${jarPath}`));
+                if (!settled) {
+                    settled = true;
+                    if (zipfile) {
+                        try { zipfile.close(); } catch { /* ignore */ }
+                    }
+                    reject(new Error(`Timeout reading JAR: ${jarPath}`));
+                }
             }, 5000);
 
-            yauzl.open(jarPath, { lazyEntries: true }, (err: any, zipfile: any) => {
-                if (err) {
+            const settle = (fn: () => void) => {
+                if (!settled) {
+                    settled = true;
                     clearTimeout(timer);
-                    reject(err);
+                    if (zipfile) {
+                        try { zipfile.close(); } catch { /* ignore */ }
+                    }
+                    fn();
+                }
+            };
+
+            yauzl.open(jarPath, { lazyEntries: true }, (err: any, zf: any) => {
+                if (err) {
+                    settle(() => reject(err));
                     return;
                 }
 
+                zipfile = zf;
                 zipfile.readEntry();
 
                 zipfile.on('entry', (entry: any) => {
                     if (entry.fileName.endsWith(suffix)) {
-                        clearTimeout(timer);
-                        try {
-                            zipfile.close();
-                        } catch (e) {
-                            // ignore
-                        }
-                        const className = entry.fileName
-                            .replace(/\.class$/, '')
-                            .replace(/\//g, '.');
-                        const packageName = className.substring(0, className.lastIndexOf('.'));
-                        resolve({
-                            className,
-                            jarPath,
-                            packageName,
-                            simpleName,
+                        settle(() => {
+                            const className = entry.fileName
+                                .replace(/\.class$/, '')
+                                .replace(/\//g, '.');
+                            const packageName = className.substring(0, className.lastIndexOf('.'));
+                            resolve({
+                                className,
+                                jarPath,
+                                packageName,
+                                simpleName,
+                            });
                         });
                         return;
                     }
@@ -229,23 +245,11 @@ export class LazyResolver {
                 });
 
                 zipfile.on('end', () => {
-                    clearTimeout(timer);
-                    try {
-                        zipfile.close();
-                    } catch (e) {
-                        // ignore
-                    }
-                    resolve(null);
+                    settle(() => resolve(null));
                 });
 
                 zipfile.on('error', (err: any) => {
-                    clearTimeout(timer);
-                    try {
-                        zipfile.close();
-                    } catch (e) {
-                        // ignore
-                    }
-                    reject(err);
+                    settle(() => reject(err));
                 });
             });
         });
@@ -259,34 +263,50 @@ export class LazyResolver {
         const classFileName = className.replace(/\./g, '/') + '.class';
 
         return new Promise((resolve, reject) => {
+            let zipfile: any = null;
+            let settled = false;
+
             const timer = setTimeout(() => {
-                reject(new Error(`Timeout reading JAR: ${jarPath}`));
+                if (!settled) {
+                    settled = true;
+                    if (zipfile) {
+                        try { zipfile.close(); } catch { /* ignore */ }
+                    }
+                    reject(new Error(`Timeout reading JAR: ${jarPath}`));
+                }
             }, 5000);
 
-            yauzl.open(jarPath, { lazyEntries: true }, (err: any, zipfile: any) => {
-                if (err) {
+            const settle = (fn: () => void) => {
+                if (!settled) {
+                    settled = true;
                     clearTimeout(timer);
-                    reject(err);
+                    if (zipfile) {
+                        try { zipfile.close(); } catch { /* ignore */ }
+                    }
+                    fn();
+                }
+            };
+
+            yauzl.open(jarPath, { lazyEntries: true }, (err: any, zf: any) => {
+                if (err) {
+                    settle(() => reject(err));
                     return;
                 }
 
+                zipfile = zf;
                 zipfile.readEntry();
 
                 zipfile.on('entry', (entry: any) => {
                     if (entry.fileName === classFileName) {
-                        clearTimeout(timer);
-                        try {
-                            zipfile.close();
-                        } catch (e) {
-                            // ignore
-                        }
-                        const packageName = className.substring(0, className.lastIndexOf('.'));
-                        const simpleName = className.substring(className.lastIndexOf('.') + 1);
-                        resolve({
-                            className,
-                            jarPath,
-                            packageName,
-                            simpleName,
+                        settle(() => {
+                            const packageName = className.substring(0, className.lastIndexOf('.'));
+                            const simpleName = className.substring(className.lastIndexOf('.') + 1);
+                            resolve({
+                                className,
+                                jarPath,
+                                packageName,
+                                simpleName,
+                            });
                         });
                         return;
                     }
@@ -294,23 +314,11 @@ export class LazyResolver {
                 });
 
                 zipfile.on('end', () => {
-                    clearTimeout(timer);
-                    try {
-                        zipfile.close();
-                    } catch (e) {
-                        // ignore
-                    }
-                    resolve(null);
+                    settle(() => resolve(null));
                 });
 
                 zipfile.on('error', (err: any) => {
-                    clearTimeout(timer);
-                    try {
-                        zipfile.close();
-                    } catch (e) {
-                        // ignore
-                    }
-                    reject(err);
+                    settle(() => reject(err));
                 });
             });
         });

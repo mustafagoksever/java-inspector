@@ -4,14 +4,20 @@ import { getServerLogPath } from './cachePaths.js';
 
 export class Logger {
     private static instances = new Map<string, Logger>();
+    private static normalizedPaths = new Map<string, string>();
     private logFile: string;
     private pid: number;
 
     static get(projectPath: string): Logger {
-        if (!this.instances.has(projectPath)) {
-            this.instances.set(projectPath, new Logger(projectPath));
+        const normalized = path.resolve(projectPath);
+        const existingKey = Logger.normalizedPaths.get(normalized);
+        const key = existingKey ?? projectPath;
+
+        if (!this.instances.has(key)) {
+            Logger.normalizedPaths.set(normalized, key);
+            this.instances.set(key, new Logger(key));
         }
-        return this.instances.get(projectPath)!;
+        return this.instances.get(key)!;
     }
 
     private constructor(private projectPath: string) {
@@ -27,7 +33,6 @@ export class Logger {
     private write(level: string, msg: string): void {
         const timestamp = new Date().toISOString();
         const levelPadded = level.padEnd(5);
-        // Extract context tag like [SERVER], [MAVEN], [TOOL:x] from message start
         const contextMatch = msg.match(/^(\[[A-Z][A-Z0-9_:-]*\])\s*(.*)$/);
         let line: string;
         if (contextMatch) {
@@ -49,15 +54,34 @@ export class Logger {
     warn(msg: string): void { this.write('WARN', msg); }
     error(msg: string): void { this.write('ERROR', msg); }
 
+    dispose(): void {
+        Logger.instances.delete(this.projectPath);
+        const normalized = path.resolve(this.projectPath);
+        Logger.normalizedPaths.delete(normalized);
+    }
+
     static clearLog(projectPath: string): void {
+        const normalized = path.resolve(projectPath);
+        const key = Logger.normalizedPaths.get(normalized) ?? projectPath;
+        const instance = Logger.instances.get(key);
+        if (instance) {
+            instance.dispose();
+        }
         try {
-            const logFile = getServerLogPath(projectPath, process.pid);
+            const logFile = getServerLogPath(key, process.pid);
             if (fs.existsSync(logFile)) {
                 fs.unlinkSync(logFile);
             }
         } catch {
             // ignore
         }
-        this.instances.delete(projectPath);
+    }
+
+    static disposeAll(): void {
+        for (const [, instance] of Logger.instances) {
+            instance.dispose();
+        }
+        Logger.instances.clear();
+        Logger.normalizedPaths.clear();
     }
 }

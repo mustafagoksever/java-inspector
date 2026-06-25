@@ -10,6 +10,7 @@ describe('Logger', () => {
     beforeEach(() => {
         // Reset singleton state
         (Logger as any).instances = new Map();
+        (Logger as any).normalizedPaths = new Map();
     });
 
     afterEach(() => {
@@ -26,6 +27,7 @@ describe('Logger', () => {
             // ignore cleanup errors
         }
         (Logger as any).instances = new Map();
+        (Logger as any).normalizedPaths = new Map();
     });
 
     it('should be a singleton per projectPath', () => {
