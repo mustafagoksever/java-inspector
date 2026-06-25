@@ -23,7 +23,7 @@ program
             process.env.NODE_ENV = options.env;
         }
 
-        console.log(`Starting Java Class Analyzer MCP Server (${options.env} mode)...`);
+        console.error(`Starting Java Class Analyzer MCP Server (${options.env} mode)...`);
 
         const server = new JavaClassAnalyzerMCPServer();
         await server.run();
