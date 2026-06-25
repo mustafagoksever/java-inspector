@@ -53,13 +53,13 @@ export class JavaClassAnalyzerMCPServer {
                 tools: [
                     {
                         name: 'scan_dependencies',
-                        description: 'Start or check the background scan of Maven dependencies. The server automatically indexes classes in the background after the first call. Use forceRefresh to rebuild the index.',
+                        description: 'Scan and index all Java classes from the project\'s Maven dependencies (pom.xml). This tool ONLY indexes classes from external dependency JARs — it does NOT index the project\'s own source code. The scan runs in the background; call again to check progress. Use forceRefresh=true to rebuild the index after dependency changes. You must call this (or let it auto-run) before using other tools.',
                         inputSchema: {
                             type: 'object',
                             properties: {
                                 projectPath: {
                                     type: 'string',
-                                    description: 'Maven project root directory path',
+                                    description: 'Absolute path to the Maven project root directory (the directory containing pom.xml)',
                                 },
                                 forceRefresh: {
                                     type: 'boolean',
@@ -78,17 +78,17 @@ export class JavaClassAnalyzerMCPServer {
                     },
                     {
                         name: 'decompile_class',
-                        description: 'Decompile a Java class from Maven dependencies into full Java source code using Vineflower. Returns the complete .java source file (method bodies included). Optionally extract a single method by name, or paginate with offset/limit. Use this when you need to read the actual implementation.',
+                        description: 'Decompile a Java class from Maven dependency JARs into readable Java source code using the Vineflower decompiler. IMPORTANT: This tool works ONLY with classes from Maven dependencies (external libraries listed in pom.xml), NOT the project\'s own source files — use your file reading tools for project source code. Use this when you need to understand how a library class works internally, see method implementations, or debug dependency behavior. Supports extracting a single method with methodName/paramTypes, and pagination with offset/limit for large classes.',
                         inputSchema: {
                             type: 'object',
                             properties: {
                                 className: {
                                     type: 'string',
-                                    description: 'Fully qualified name of the Java class to decompile, e.g., io.micrometer.observation.ObservationRegistry or com.example.QueryBizOrderDO',
+                                    description: 'Fully qualified class name from a Maven dependency JAR (e.g., org.springframework.web.bind.annotation.RequestMapping, io.micrometer.observation.ObservationRegistry). Must be a class from an external dependency, not from the project\'s own source code.',
                                 },
                                 projectPath: {
                                     type: 'string',
-                                    description: 'Maven project root directory path',
+                                    description: 'Absolute path to the Maven project root directory (the directory containing pom.xml)',
                                 },
                                 useCache: {
                                     type: 'boolean',
@@ -130,17 +130,17 @@ export class JavaClassAnalyzerMCPServer {
                     },
                     {
                         name: 'analyze_class',
-                        description: 'Analyze a Java class structure (signatures only, no method bodies) from Maven dependencies using javap. Returns fields, methods, constructors, superclass and interfaces. Use this for a lightweight overview when you do not need full source code.',
+                        description: 'Get the structure (fields, methods, constructors, superclass, interfaces) of a Java class from Maven dependency JARs using javap — signatures only, no method bodies. IMPORTANT: This tool works ONLY with classes from Maven dependencies (external libraries in pom.xml), NOT the project\'s own source files. Use this instead of decompile_class when you only need the API surface (e.g., available methods, field types, class hierarchy) without the full implementation. Much faster than decompilation.',
                         inputSchema: {
                             type: 'object',
                             properties: {
                                 className: {
                                     type: 'string',
-                                    description: 'Fully qualified name of the Java class to analyze, e.g., io.micrometer.observation.ObservationRegistry or com.example.QueryBizOrderDO',
+                                    description: 'Fully qualified class name from a Maven dependency JAR (e.g., org.springframework.web.bind.annotation.RequestMapping, io.micrometer.observation.ObservationRegistry). Must be a class from an external dependency, not from the project\'s own source code.',
                                 },
                                 projectPath: {
                                     type: 'string',
-                                    description: 'Maven project root directory path',
+                                    description: 'Absolute path to the Maven project root directory (the directory containing pom.xml)',
                                 },
                                 filter: {
                                     type: 'string',
@@ -160,17 +160,17 @@ export class JavaClassAnalyzerMCPServer {
                     },
                     {
                         name: 'search_class',
-                        description: 'Fuzzy search for Java classes inside the project\'s Maven dependencies. Results may be partial while the background scan is in progress.',
+                        description: 'Search for Java classes by name within the project\'s Maven dependency JARs (fuzzy matching). IMPORTANT: This searches ONLY classes from Maven dependencies (external libraries in pom.xml), NOT the project\'s own source files. Use this to find the fully qualified class name before calling decompile_class or analyze_class. Example queries: \'JpaRepository\', \'HttpClient\', \'ObjectMapper\'. Results may be partial if the background scan is still in progress.',
                         inputSchema: {
                             type: 'object',
                             properties: {
                                 query: {
                                     type: 'string',
-                                    description: 'Search query (partial class name, e.g. "ObservationRegistry", "JpaRepository", or "QueryBizOrderDO")',
+                                    description: 'Search query — partial or full class name from Maven dependencies (e.g. "JpaRepository", "HttpClient", "ObjectMapper")',
                                 },
                                 projectPath: {
                                     type: 'string',
-                                    description: 'Maven project root directory path',
+                                    description: 'Absolute path to the Maven project root directory (the directory containing pom.xml)',
                                 },
                                 limit: {
                                     type: 'number',
@@ -189,17 +189,17 @@ export class JavaClassAnalyzerMCPServer {
                     },
                     {
                         name: 'get_inheritance_tree',
-                        description: 'Get the full inheritance hierarchy (superclasses) of a Java class from Maven dependencies. The server resolves classes on-demand if they are not yet indexed.',
+                        description: 'Get the full inheritance chain (superclasses and interfaces) of a Java class from Maven dependency JARs. IMPORTANT: This tool works ONLY with classes from Maven dependencies (external libraries in pom.xml), NOT the project\'s own source files. Use this to understand class hierarchies, find parent classes, and discover which interfaces a dependency class implements. Classes not found in dependencies are marked as unresolved.',
                         inputSchema: {
                             type: 'object',
                             properties: {
                                 className: {
                                     type: 'string',
-                                    description: 'Fully qualified name of the Java class, e.g., io.micrometer.observation.ObservationRegistry or com.example.QueryBizOrderDO',
+                                    description: 'Fully qualified class name from a Maven dependency JAR (e.g., org.springframework.web.bind.annotation.RequestMapping, io.micrometer.observation.ObservationRegistry). Must be a class from an external dependency, not from the project\'s own source code.',
                                 },
                                 projectPath: {
                                     type: 'string',
-                                    description: 'Maven project root directory path',
+                                    description: 'Absolute path to the Maven project root directory (the directory containing pom.xml)',
                                 },
                                 format: {
                                     type: 'string',
