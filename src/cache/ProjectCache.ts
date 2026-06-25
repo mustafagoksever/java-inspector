@@ -413,7 +413,8 @@ export class ProjectCache {
                     .slice(0, 10)
                     .map((e: ClassIndexEntry) => `${e.className} -> ${e.jarPath.split(/[/\\]/).pop()}`);
 
-                // Write scan state only on completion (JSONL is the source of truth for recovery)
+                // Write scan state for crash recovery (JSONL is source of truth for index data)
+                await this.writeScanState(projectPath, state);
             });
         } finally {
             await release();
