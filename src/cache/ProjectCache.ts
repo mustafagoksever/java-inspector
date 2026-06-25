@@ -54,19 +54,18 @@ export class ProjectCache {
     // Deduplicate concurrent loads
     private loadPromises: Map<string, Promise<void>> = new Map();
     // Per-project write locks (in-process)
-    private locks: Map<string, Promise<void>> = new Map();
+    private lockQueues: Map<string, Promise<void>> = new Map();
 
     private async withInProcessLock<T>(projectPath: string, fn: () => Promise<T>): Promise<T> {
-        while (this.locks.has(projectPath)) {
-            await this.locks.get(projectPath);
-        }
-        const promise = fn();
-        const lockPromise = promise.then(() => {}).catch(() => {});
-        this.locks.set(projectPath, lockPromise);
+        const prev = this.lockQueues.get(projectPath) ?? Promise.resolve();
+        let release: () => void;
+        const next = new Promise<void>(r => release = r);
+        this.lockQueues.set(projectPath, next);
         try {
-            return await promise;
+            await prev;
+            return await fn();
         } finally {
-            this.locks.delete(projectPath);
+            release!();
         }
     }
 

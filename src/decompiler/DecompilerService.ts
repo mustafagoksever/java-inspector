@@ -17,22 +17,23 @@ const execFileAsync = promisify(execFile);
 
 export class DecompilerService {
     private scanner: DependencyScanner;
-    private decompilerPath: string;
 
     constructor() {
         this.scanner = DependencyScanner.getInstance();
-        this.decompilerPath = '';
     }
 
-    private async initializeDecompilerPath(logger?: Logger): Promise<void> {
-        if (!this.decompilerPath) {
-            this.decompilerPath = await this.findVineflowerJar(logger);
-            if (!this.decompilerPath) {
-                throw new Error('Vineflower decompiler tool not found. Please download Vineflower jar to lib directory or set DECOMPILER_PATH environment variable');
-            }
-            logger?.info(`[DECOMPILE] Vineflower tool path: ${this.decompilerPath}`);
-            console.error(`Vineflower tool path: ${this.decompilerPath}`);
+    private async resolveDecompilerPath(externalDecompilerPath?: string, logger?: Logger): Promise<string> {
+        if (externalDecompilerPath) {
+            logger?.info(`[DECOMPILE] Using external decompiler: ${externalDecompilerPath}`);
+            return externalDecompilerPath;
         }
+
+        const decompilerPath = await this.findVineflowerJar(logger);
+        if (!decompilerPath) {
+            throw new Error('Vineflower decompiler tool not found. Please download Vineflower jar to lib directory or set DECOMPILER_PATH environment variable');
+        }
+        logger?.info(`[DECOMPILE] Vineflower tool path: ${decompilerPath}`);
+        return decompilerPath;
     }
 
     /**
@@ -44,14 +45,8 @@ export class DecompilerService {
         logger.info(`[DECOMPILE] Request: className=${className}, useCache=${useCache}, decompilerPath=${externalDecompilerPath || 'auto'}`);
 
         try {
-            // If external decompiler path is specified, use external path
-            if (externalDecompilerPath) {
-                this.decompilerPath = externalDecompilerPath;
-                logger.info(`[DECOMPILE] Using external decompiler: ${this.decompilerPath}`);
-            } else {
-                await this.initializeDecompilerPath(logger);
-                logger.info(`[DECOMPILE] Decompiler path: ${this.decompilerPath}`);
-            }
+            // Resolve the decompiler path for this specific request
+            const activeDecompilerPath = await this.resolveDecompilerPath(externalDecompilerPath, logger);
 
             // 1. Check cache
             const cachePath = this.getCachePath(className, projectPath);
@@ -86,7 +81,7 @@ export class DecompilerService {
 
             // 4. Use Vineflower to decompile
             const decompStart = performance.now();
-            const sourceCode = await this.decompileWithVineflower(classFilePath, className, projectPath, logger);
+            const sourceCode = await this.decompileWithVineflower(classFilePath, className, projectPath, activeDecompilerPath, logger);
             const decompDuration = ((performance.now() - decompStart) / 1000).toFixed(2);
             logger.debug(`[DECOMPILE] Vineflower completed in ${decompDuration}s. Source length: ${sourceCode.length}`);
 
@@ -209,8 +204,8 @@ export class DecompilerService {
      * output folder, run the decompiler, read the generated .java file,
      * and clean up afterwards.
      */
-    private async decompileWithVineflower(classFilePath: string, className: string, projectPath: string, logger?: Logger): Promise<string> {
-        if (!this.decompilerPath) {
+    private async decompileWithVineflower(classFilePath: string, className: string, projectPath: string, decompilerPath: string, logger?: Logger): Promise<string> {
+        if (!decompilerPath) {
             throw new Error('Vineflower decompiler tool not found, please ensure Vineflower jar is in classpath');
         }
 
@@ -219,13 +214,13 @@ export class DecompilerService {
 
         try {
             const javaCmd = this.getJavaCommand(logger);
-            const cmdMsg = `Executing Vineflower: ${javaCmd} -jar "${this.decompilerPath}" "${classFilePath}" "${outputDir}"`;
+            const cmdMsg = `Executing Vineflower: ${javaCmd} -jar "${decompilerPath}" "${classFilePath}" "${outputDir}"`;
             logger?.debug(`[DECOMPILE] ${cmdMsg}`);
             console.error(cmdMsg);
 
             const { stdout, stderr } = await execFileAsync(
                 javaCmd,
-                ['-jar', this.decompilerPath, classFilePath, outputDir],
+                ['-jar', decompilerPath, classFilePath, outputDir],
                 {
                     timeout: 30000
                 }
