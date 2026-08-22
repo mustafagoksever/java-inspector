@@ -9,6 +9,8 @@ import { createWriteStream } from 'fs';
 import { DependencyScanner } from '../scanner/DependencyScanner.js';
 import { getDecompileCacheDir, getClassTempDir } from '../utils/cachePaths.js';
 import { Logger } from '../utils/Logger.js';
+import { getResultCacheDir } from '../utils/cachePaths.js';
+import { jarIndexer } from '../scanner/JarIndexer.js';
 
 const __dfFilename = fileURLToPath(import.meta.url);
 const __dfDirname = path.dirname(__dfFilename);
@@ -22,12 +24,7 @@ export class DecompilerService {
         this.scanner = DependencyScanner.getInstance();
     }
 
-    private async resolveDecompilerPath(externalDecompilerPath?: string, logger?: Logger): Promise<string> {
-        if (externalDecompilerPath) {
-            logger?.info(`[DECOMPILE] Using external decompiler: ${externalDecompilerPath}`);
-            return externalDecompilerPath;
-        }
-
+    private async resolveDecompilerPath(logger?: Logger): Promise<string> {
         const decompilerPath = await this.findVineflowerJar(logger);
         if (!decompilerPath) {
             throw new Error('Vineflower decompiler tool not found. Please download Vineflower jar to lib directory or set DECOMPILER_PATH environment variable');
@@ -39,14 +36,14 @@ export class DecompilerService {
     /**
      * Decompile specified Java class file
      */
-    async decompileClass(className: string, projectPath: string, useCache: boolean = true, externalDecompilerPath?: string): Promise<string> {
+    async decompileClass(className: string, projectPath: string, useCache: boolean = true): Promise<string> {
         const logger = Logger.get(projectPath);
         const start = performance.now();
-        logger.info(`[DECOMPILE] Request: className=${className}, useCache=${useCache}, decompilerPath=${externalDecompilerPath || 'auto'}`);
+        logger.info(`[DECOMPILE] Request: className=${className}, useCache=${useCache}, decompilerPath=trusted-config`);
 
         try {
             // Resolve the decompiler path for this specific request
-            const activeDecompilerPath = await this.resolveDecompilerPath(externalDecompilerPath, logger);
+            const activeDecompilerPath = await this.resolveDecompilerPath(logger);
 
             // 1. Check cache
             const cachePath = this.getCachePath(className, projectPath);
@@ -111,6 +108,32 @@ export class DecompilerService {
         }
     }
 
+    /** Decompile directly from a selected JAR without Maven or a project index. */
+    async decompileClassFromJar(
+        className: string,
+        jarPath: string,
+        contextPath: string,
+        entryPath?: string,
+        useCache: boolean = true,
+    ): Promise<string> {
+        const logger = Logger.get(contextPath);
+        const fingerprint = await jarIndexer.fingerprint(jarPath);
+        const safeClassName = className.replace(/[^a-zA-Z0-9_$.-]/g, '_');
+        const cachePath = path.join(getResultCacheDir(contextPath), fingerprint.key, 'source', `${safeClassName}.java`);
+        if (useCache && await fs.pathExists(cachePath)) return readFile(cachePath, 'utf8');
+
+        const activeDecompilerPath = await this.resolveDecompilerPath(logger);
+        let classFilePath: string | undefined;
+        try {
+            classFilePath = await this.extractClassFile(jarPath, className, contextPath, entryPath);
+            const source = await this.decompileWithVineflower(classFilePath, className, contextPath, activeDecompilerPath, logger);
+            if (useCache) await fs.outputFile(cachePath, source, 'utf8');
+            return source;
+        } finally {
+            if (classFilePath) await fs.remove(classFilePath).catch(() => {});
+        }
+    }
+
     /**
      * Get cache file path
      */
@@ -125,8 +148,8 @@ export class DecompilerService {
     /**
      * Extract specified .class file from JAR package
      */
-    private async extractClassFile(jarPath: string, className: string, projectPath: string): Promise<string> {
-        const classFileName = className.replace(/\./g, '/') + '.class';
+    private async extractClassFile(jarPath: string, className: string, projectPath: string, explicitEntryPath?: string): Promise<string> {
+        const classFileName = explicitEntryPath || className.replace(/\./g, '/') + '.class';
         const tempDir = getClassTempDir(projectPath);
         // Create directory structure by full package name path
         const packagePath = className.substring(0, className.lastIndexOf('.'));
@@ -261,6 +284,9 @@ export class DecompilerService {
             if (error instanceof Error && error.message.includes('timeout')) {
                 throw new Error('Vineflower decompilation timeout, please check Java environment and decompiler tool');
             }
+            if (error instanceof Error && error.message.includes('UnsupportedClassVersionError')) {
+                throw new Error('Vineflower 1.11.2 requires Java 17 or newer. The active Java runtime is too old; update JAVA_HOME or PATH.');
+            }
             throw new Error(`Vineflower decompilation failed: ${error instanceof Error ? error.message : String(error)}`);
         } finally {
             // Always clean up temporary output directory
@@ -329,12 +355,12 @@ export class DecompilerService {
     /**
      * Batch decompile multiple classes
      */
-    async decompileClasses(classNames: string[], projectPath: string, useCache: boolean = true, externalDecompilerPath?: string): Promise<Map<string, string>> {
+    async decompileClasses(classNames: string[], projectPath: string, useCache: boolean = true): Promise<Map<string, string>> {
         const results = new Map<string, string>();
 
         for (const className of classNames) {
             try {
-                const sourceCode = await this.decompileClass(className, projectPath, useCache, externalDecompilerPath);
+                const sourceCode = await this.decompileClass(className, projectPath, useCache);
                 results.set(className, sourceCode);
             } catch (error) {
                 console.warn(`Failed to decompile class ${className}: ${error}`);

@@ -20,6 +20,7 @@ export interface ClassIndexEntry {
 }
 
 export interface ClasspathData {
+    schemaVersion: 3;
     pomHash: string;
     jarPaths: string[];
     classpathHash: string;
@@ -27,6 +28,7 @@ export interface ClasspathData {
 }
 
 export interface ScanStateData {
+    schemaVersion?: 3;
     jarCount: number;
     processedJars: string[];
     isComplete: boolean;
@@ -49,6 +51,8 @@ export interface ClassIndexData {
 export class ProjectCache {
     // In-memory indexes per project: Map<className, ClassIndexEntry>
     private indexes: Map<string, Map<string, ClassIndexEntry>> = new Map();
+    // V3 view preserving duplicate FQCNs from different artifacts.
+    private multiIndexes: Map<string, Map<string, ClassIndexEntry[]>> = new Map();
     // Scan state per project
     private states: Map<string, ScanStateData> = new Map();
     // Deduplicate concurrent loads
@@ -96,6 +100,7 @@ export class ProjectCache {
      */
     private async loadFromDisk(projectPath: string): Promise<void> {
         const index = new Map<string, ClassIndexEntry>();
+        const multiIndex = new Map<string, ClassIndexEntry[]>();
         const jsonlPath = getClassIndexJsonlPath(projectPath);
 
         if (await fs.pathExists(jsonlPath)) {
@@ -115,6 +120,11 @@ export class ProjectCache {
                             for (const entry of batch) {
                                 if (entry && entry.className) {
                                     index.set(entry.className, entry);
+                                    const candidates = multiIndex.get(entry.className) ?? [];
+                                    if (!candidates.some(candidate => candidate.jarPath === entry.jarPath)) {
+                                        candidates.push(entry);
+                                        multiIndex.set(entry.className, candidates);
+                                    }
                                 }
                             }
                         }
@@ -134,6 +144,7 @@ export class ProjectCache {
         }
 
         this.indexes.set(projectPath, index);
+        this.multiIndexes.set(projectPath, multiIndex);
 
         // Load scan state
         const statePath = getScanStatePath(projectPath);
@@ -194,6 +205,7 @@ export class ProjectCache {
 
         try {
             const data: ClasspathData = await fs.readJson(classpathPath);
+            if (data.schemaVersion !== 3) return null;
             const currentHash = await this.getPomHash(projectPath);
             if (data.pomHash !== currentHash) {
                 return null;
@@ -215,6 +227,7 @@ export class ProjectCache {
 
         try {
             const data: ClasspathData = await fs.readJson(classpathPath);
+            if (data.schemaVersion !== 3) return null;
             return data.classpathHash;
         } catch {
             return null;
@@ -231,6 +244,7 @@ export class ProjectCache {
             await this.withInProcessLock(projectPath, async () => {
                 const classpathPath = getClasspathPath(projectPath);
                 const data: ClasspathData = {
+                    schemaVersion: 3,
                     pomHash,
                     jarPaths,
                     classpathHash: this.getClasspathHash(jarPaths),
@@ -251,6 +265,18 @@ export class ProjectCache {
         const index = this.indexes.get(projectPath);
         if (!index) return undefined;
         return index.get(className);
+    }
+
+    async getEntries(projectPath: string, className: string): Promise<ClassIndexEntry[]> {
+        await this.ensureLoaded(projectPath);
+        return [...(this.multiIndexes.get(projectPath)?.get(className) ?? [])];
+    }
+
+    async getAllEntriesWithDuplicates(projectPath: string): Promise<ClassIndexEntry[]> {
+        await this.ensureLoaded(projectPath);
+        const multi = this.multiIndexes.get(projectPath);
+        if (!multi) return [];
+        return [...multi.values()].flat();
     }
 
     /**
@@ -305,6 +331,7 @@ export class ProjectCache {
         if (!state || !state.isComplete) {
             return false;
         }
+        if (state.schemaVersion !== 3) return false;
 
         // Validate pomHash
         try {
@@ -363,9 +390,9 @@ export class ProjectCache {
     ): Promise<void> {
         if (entries.length === 0 && !processedJars) return;
 
-        const release = await CrossProcessLock.acquire(projectPath, 'write');
-        try {
-            await this.withInProcessLock(projectPath, async () => {
+        await this.withInProcessLock(projectPath, async () => {
+            const release = await CrossProcessLock.acquire(projectPath, 'write');
+            try {
                 await this.ensureLoaded(projectPath);
 
                 const index = this.indexes.get(projectPath);
@@ -373,10 +400,17 @@ export class ProjectCache {
                     this.indexes.set(projectPath, new Map());
                 }
                 const map = this.indexes.get(projectPath)!;
+                if (!this.multiIndexes.has(projectPath)) this.multiIndexes.set(projectPath, new Map());
+                const multiMap = this.multiIndexes.get(projectPath)!;
 
                 // Update memory
                 for (const entry of entries) {
                     map.set(entry.className, entry);
+                    const candidates = multiMap.get(entry.className) ?? [];
+                    const existingIndex = candidates.findIndex(candidate => candidate.jarPath === entry.jarPath);
+                    if (existingIndex >= 0) candidates[existingIndex] = entry;
+                    else candidates.push(entry);
+                    multiMap.set(entry.className, candidates);
                 }
 
                 // Append to JSONL
@@ -388,6 +422,7 @@ export class ProjectCache {
                 let state = this.states.get(projectPath);
                 if (!state) {
                     state = {
+                        schemaVersion: 3,
                         jarCount: jarCount ?? 0,
                         processedJars: processedJars ?? [],
                         isComplete: false,
@@ -398,6 +433,7 @@ export class ProjectCache {
                     };
                     this.states.set(projectPath, state);
                 } else {
+                    state.schemaVersion = 3;
                     if (jarCount !== undefined) state.jarCount = jarCount;
                     if (processedJars) {
                         state.processedJars = [...new Set([...state.processedJars, ...processedJars])];
@@ -415,10 +451,10 @@ export class ProjectCache {
 
                 // Write scan state for crash recovery (JSONL is source of truth for index data)
                 await this.writeScanState(projectPath, state);
-            });
-        } finally {
-            await release();
-        }
+            } finally {
+                await release();
+            }
+        });
     }
 
     /**
@@ -439,6 +475,7 @@ export class ProjectCache {
                 let state = this.states.get(projectPath);
                 if (!state) {
                     state = {
+                        schemaVersion: 3,
                         jarCount: data.jarCount,
                         processedJars: [],
                         isComplete: true,
@@ -448,6 +485,7 @@ export class ProjectCache {
                         classpathHash: classpathHash ?? '',
                     };
                 } else {
+                    state.schemaVersion = 3;
                     state.jarCount = data.jarCount;
                     state.isComplete = true;
                     state.lastUpdated = new Date().toISOString();
@@ -477,6 +515,7 @@ export class ProjectCache {
 
         await this.withInProcessLock(projectPath, async () => {
             this.indexes.delete(projectPath);
+            this.multiIndexes.delete(projectPath);
             this.states.delete(projectPath);
             this.loadPromises.delete(projectPath);
 

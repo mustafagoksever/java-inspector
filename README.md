@@ -1,340 +1,215 @@
 # Java Inspector
 
-> **Decompile Maven dependencies into readable Java source — directly inside your AI agent.**
+Java Inspector is an MCP server that gives AI agents fast, read-only access to code and metadata inside Maven dependencies, local JARs, executable JARs, WARs, and the JDK.
 
-[![npm](https://img.shields.io/npm/v/@mustafagoksever/java-inspector)](https://www.npmjs.com/package/@mustafagoksever/java-inspector)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+The server starts accepting MCP calls immediately. Maven dependency scanning continues in the background, while an interactive query can promote the JAR it needs to a foreground queue and return without waiting for the complete project index.
 
----
+## Requirements
 
-## What is this?
+- Node.js 16 or newer
+- Java 17 or newer (`java` and `javap`); required by bundled Vineflower 1.11.2
+- Maven for Maven project discovery and dependency resolution
 
-AI editors can't read compiled `.class` files. Ask *"How does `JpaRepository` work?"* and the agent hallucinates.
+Vineflower 1.11.2 is bundled in `lib/`.
 
-**Java Inspector** is an MCP server that exposes the internals of your project's Maven dependencies (Spring, Hibernate, Jackson, Micrometer, etc.) as decompiled Java source code. Zero configuration — just point your agent at it.
+## Install and configure
 
-### Supported operations
-
-| Tool | What it does |
-|------|--------------|
-| `scan_dependencies` | Kicks off a background scan of every JAR on the Maven classpath. Call again to poll progress. |
-| `decompile_class` | Returns the **full Java source** (method bodies and all) via Vineflower. Optionally extract a single method by `methodName`, or paginate with `offset`/`limit`. |
-| `analyze_class` | Returns the **structural signature** — fields, methods, constructors, inheritance — via `javap`. No method bodies. |
-| `search_class` | Fuzzy-find classes by partial name (e.g. `"ObservationRegistry"`). |
-| `get_inheritance_tree` | Walks the superclass chain up to `java.lang.Object`. |
-
-### Response formats
-
-Every tool accepts a `format` parameter (`text` | `json` | `toon`). Default is `text`.
-
-| Format | What you get | Best for |
-|--------|-------------|----------|
-| `text` | Human-readable markdown, tables, code blocks | Reading by LLMs and humans |
-| `json` | Pure `structuredContent` — no text wrapper | Programmatic consumption, piping to other tools |
-| `toon` | [Token-Oriented Object Notation](https://github.com/toon-format/toon) — compact, schema-aware text | LLM prompts where token count matters (~40% fewer tokens than JSON) |
-
-**`json`** strips the text wrapper and returns only the structured payload.  
-**`toon`** encodes the same payload via `@toon-format/toon`, giving you YAML-like readability with CSV-like compactness for uniform arrays.
-
----
-
-## Architecture
-
-```mermaid
-graph LR
-    A[AI Agent<br/>Claude / Cursor / Codex / Opencode] -->|MCP| B[java-inspector<br/>TypeScript Server]
-    B -->|auto-detect| C{Maven Resolver}
-    C -->|priority 1| D[MAVEN_CMD env]
-    C -->|priority 2| E[mvnd daemon<br/>~2x faster]
-    C -->|priority 3| F[MAVEN_HOME/bin/mvn]
-    C -->|priority 4| G[mvn from PATH]
-    B -->|dependency:build-classpath| H[~/.m2/repository]
-    H -->|JAR streams| I[yauzl extractor]
-    I -->|class names| J[JSON Lines Cache]
-    B -->|cache hit| J
-    B -->|cache miss| I
-    B -->|java -jar vineflower.jar| K[Vineflower 1.11.2<br/>Decompiler]
-    K -->|*.java source| A
+```bash
+npm install -g @mustafagoksever/java-inspector
 ```
-
-### Why JSON Lines?
-
-Traditional JSON caches rewrite the entire file on every batch — O(n²) overhead for large projects. We use **append-only JSON Lines**:
-
-- **Crash-safe**: each line is independent; a truncated final line is skipped on reload.
-- **Fast startup**: the server replays the JSONL into an in-memory `Map<string, ClassIndexEntry>` on launch.
-- **Low memory**: ~35 MB RAM for 100,000 classes.
-
-### Cache layout
-
-```
-~/.cache/java-inspector/<project>_<hash>/
-├── classpath.json           # pomHash + jarPaths[] + classpathHash + timestamp
-├── class-index.jsonl        # Append-only ClassIndexEntry batches
-├── scan-state.json          # jarCount, processedJars[], isComplete
-├── server-<pid>.log         # Per-process append-only logs (multi-process safe)
-├── write.lock               # Cross-process lock for JSONL / state writes
-├── scan.lock                # Cross-process lock for scan lifecycle
-└── decompile-cache-vineflower/  # Cached .java sources
-```
-
----
-
-## Quick Start
-
-Add to your MCP client config:
-
-### Claude Desktop
-
-Edit `%APPDATA%\Claude\claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "java-inspector": {
-      "command": "npx",
-      "args": ["-y", "@mustafagoksever/java-inspector"]
+      "command": "java-inspector",
+      "args": ["start"]
     }
   }
 }
 ```
 
-### Cursor
+For local development:
 
-`Settings` → `MCP Servers` → Add:
+```bash
+npm ci
+npm run build
+node dist/cli.js start
+```
+
+## Startup discovery
+
+After the MCP transport connects, Java Inspector performs non-blocking discovery:
+
+1. If `cwd/pom.xml` exists, that Maven project is used.
+2. Otherwise directories are searched breadth-first.
+3. Every `pom.xml` at the first matching depth is selected.
+4. Deeper POMs are not independently scanned.
+5. Maven classpaths are resolved and their JARs enter the background light-scan queue.
+
+Directories such as `.git`, `node_modules`, `.gradle`, `target`, `build`, and `out` are excluded from POM discovery.
+
+Local, non-Maven JARs are not scanned at startup. They are found and indexed only when a tool call supplies a path, directory, or filename prefix.
+
+## Tools
+
+| Tool | Purpose |
+|---|---|
+| `scan_project` | Start, refresh, or poll the non-blocking Maven scan. |
+| `find_jar` | Find an artifact by path, filename, prefix, substring, or Maven coordinates without opening it. |
+| `inspect_jar` | Inspect manifest, Maven metadata, packages, classes, resources, and nested artifacts. |
+| `search_class` | Search the live partial index and foreground-scan relevant JARs on a miss. |
+| `search_code` | Search methods, fields, annotations, references, or string constants without mass decompilation. |
+| `find_implementations` | Find direct or transitive implementations/subtypes from lazy deep indexes. |
+| `inspect_class` | Return source, API, hierarchy, bytecode, or all views for a class. |
+| `explain_dependency` | Run a filtered Maven dependency tree for a selected artifact. |
+| `search_resources` | Search resource paths or bounded text content. |
+| `read_resource` | Read an exact text resource with line pagination. |
+
+Every tool supports `text`, `json`, and `toon` output where applicable.
+
+## Artifact selectors
+
+Class, JAR, and resource tools share the same selection model:
+
+- `jarPath`: exact absolute JAR path; fastest and unambiguous.
+- `jarDirectory` + `jarNamePrefix`: useful for Maven-free projects with `lib/` directories.
+- `workspacePath` + `jarNamePrefix`: search the Maven classpath and workspace.
+- `workspacePath`: use the live partial index and bounded lazy fallback.
+- `coordinates`: `groupId:artifactId[:version[:classifier]]`.
+
+When no selector is supplied, tools use the server's current working directory. If Maven classpath resolution is still running, searches return `complete: false` instead of reporting a definitive miss. Per-JAR scan failures are returned in `errors`; an unreadable exact `jarPath` fails the tool call.
+
+If multiple JARs or classes match, the server returns candidates instead of silently choosing one.
+
+### Inspect a class from a local JAR
 
 ```json
 {
-  "mcpServers": {
-    "java-inspector": {
-      "command": "npx",
-      "args": ["-y", "@mustafagoksever/java-inspector"]
-    }
-  }
+  "className": "com.vendor.Client",
+  "jarPath": "C:\\project\\lib\\vendor-client-2.1.jar",
+  "view": "source"
 }
 ```
 
-### Codex
-
-Edit `~/.codex/config.toml`:
-
-```toml
-[mcp_servers.java-inspector]
-command = "npx"
-args = ["-y", "@mustafagoksever/java-inspector"]
-```
-
-### Opencode
-
-Edit `%APPDATA%\opencode\config.json`:
+### Find an exception message
 
 ```json
 {
-  "mcp": {
-    "java-inspector": {
-      "type": "local",
-      "command": [
-        "npx",
-        "-y",
-        "@mustafagoksever/java-inspector"
-      ]
-    }
-  }
+  "query": "Connection refused",
+  "kind": "string",
+  "workspacePath": "C:\\project",
+  "mode": "balanced"
 }
 ```
 
-Restart your editor and ask: *"Show me the source of `ObservationRegistry`"*
+### Find implementations
 
-That's it. No `JAVA_HOME` tweaks. No manual decompiler download. The server ships the ~1.8 MB Vineflower JAR inside the package.
-
----
-
-## Workflow
-
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant A as AI Agent
-    participant S as java-inspector
-    participant M as Maven / mvnd
-    participant C as Cache
-
-    U->>A: "Show me JpaRepository source"
-    A->>S: decompile_class("org.springframework.data.jpa.repository.JpaRepository")
-    alt Index not built yet
-        S->>M: dependency:build-classpath
-        M-->>S: JAR list
-        S->>S: Background scan (20 JARs in parallel)
-        S-->>A: Class found via lazy JAR search
-    else Cache hit
-        S->>C: Map.get(className) — O(1)
-        C-->>S: ClassIndexEntry
-    end
-    S->>S: Extract .class from JAR (yauzl)
-    S->>S: java -jar vineflower.jar ...
-    S-->>A: Decompiled .java source
-    A-->>U: Formatted response
+```json
+{
+  "className": "com.vendor.Transport",
+  "workspacePath": "C:\\project",
+  "transitive": true
+}
 ```
 
+### Inspect a JDK class
 
-
-## Cache invalidation
-
-```mermaid
-flowchart TD
-    A[scan_dependencies called] --> B{isIndexComplete?}
-    B -->|pomHash mismatch| C[Invalidate disk + memory]
-    B -->|classpathHash mismatch| C
-    B -->|both match| D[Return existing index]
-    C --> E[Delete ~/.cache/java-inspector/<hash>/*]
-    E --> F[Re-run Maven dependency:build-classpath]
-    F --> G[Start background scan]
-    D --> H[Return Map of classes]
+```json
+{
+  "className": "java.util.ArrayList",
+  "view": "all"
+}
 ```
 
-Invalidation triggers:
+JDK source is read from `src.zip` when available. API and bytecode views use `javap`.
 
-1. **Module `pom.xml` changes** — `pomHash` mismatch.
-2. **Parent POM / dependency-management changes** — `classpathHash` mismatch.
-3. **Manual** — call `scan_dependencies` with `forceRefresh: true`. This force-releases cross-process locks and wipes the cache directory before restarting.
+## Foreground and background scheduling
 
----
+All JAR reads pass through a shared coordinator:
 
-## Platform Support
+- Up to eight JAR reads run concurrently.
+- Background scanning may occupy at most six slots.
+- Two slots remain available for interactive foreground work.
+- A foreground request promotes a queued background JAR.
+- Concurrent requests for the same JAR share one Promise and one cache write.
+- Light scans time out after 30 seconds; deep scans time out after 60 seconds.
 
-| OS | Command |
-|----|---------|
-| Windows | `npx -y @mustafagoksever/java-inspector` |
-| Linux | `npx -y @mustafagoksever/java-inspector` |
-| macOS | `npx -y @mustafagoksever/java-inspector` |
+The background scan builds a light index from ZIP entries. More expensive class-file metadata is generated only when `search_code` or `find_implementations` needs it.
 
-**Requirements:** Node.js ≥ 16, Java runtime, Maven (or `mvnd` for faster resolves).
+Context-wide deep searches are intentionally bounded. A partial response includes `complete`, `scannedJarCount`, and `remainingJarCount`. Calling the tool again continues using the already cached deep indexes.
 
----
+## Class inspection
+
+`inspect_class` supports:
+
+- `source`: local `*-sources.jar`, embedded `.java`, or Vineflower decompilation.
+- `api`: fields, methods, constructors, modifiers, superclass, and interfaces via `javap`.
+- `hierarchy`: resolved superclass chain.
+- `bytecode`: `javap -c -l -p -s` output.
+- `all`: all available views.
+
+Source responses support `methodName`, `paramTypes`, `offset`, and `limit`.
+
+The decompiler executable cannot be overridden by a tool argument. Java Inspector uses the bundled Vineflower JAR or the operator-controlled `DECOMPILER_PATH` environment variable.
+
+## JAR layouts
+
+Light indexing understands:
+
+- Ordinary and shaded JARs
+- Multi-release entries under `META-INF/versions/`
+- Spring Boot classes under `BOOT-INF/classes`
+- WAR classes under `WEB-INF/classes`
+- JMOD class paths under `classes/`
+- Nested artifact metadata under `BOOT-INF/lib`, `WEB-INF/lib`, and `lib`
+- Maven `pom.properties`, manifests, source JARs, and text resources
+
+Nested JAR contents are extracted and scanned only when explicitly needed.
+
+## Cache
+
+Cache data is stored under:
+
+```text
+~/.cache/java-inspector/<context>_<hash>/
+```
+
+Important entries include:
+
+```text
+classpath.json
+class-index.jsonl
+scan-state.json
+jar-indexes-v3/
+results-v3/
+server-<pid>.log
+```
+
+Per-JAR caches use resolved path, size, and modification time as their fingerprint. Nested artifacts additionally use their parent fingerprint and ZIP entry identity. JSONL project indexes remain append-only and crash-safe, with cross-process locks protecting writes.
 
 ## Environment variables
 
-| Variable | Effect |
-|----------|--------|
-| `JAVA_HOME` | Locates `java` and `javap`. |
-| `MAVEN_HOME` | Locates `mvn` / `mvn.cmd`. |
-| `MAVEN_CMD` | Override executable entirely — e.g. `mvnd`, `mvnw`, or a full path. |
-| `MAVEN_REPO` | Overrides `~/.m2/repository`. |
-| `DECOMPILER_PATH` | Use a custom Vineflower JAR instead of the bundled one. |
-| `NODE_ENV=development` | Enables verbose `server.log` output. |
+| Variable | Purpose |
+|---|---|
+| `NODE_ENV` | Enables additional development logging. |
+| `JAVA_HOME` | Locates `java`, `javap`, and JDK `src.zip`. |
+| `MAVEN_HOME` | Locates Maven. |
+| `MAVEN_CMD` | Overrides the Maven executable. |
+| `MAVEN_REPO` | Overrides the local Maven repository path. |
+| `DECOMPILER_PATH` | Overrides the bundled Vineflower JAR. |
 
----
+Maven command resolution order is `MAVEN_CMD`, `mvnd`, `MAVEN_HOME/bin/mvn`, then `mvn` from `PATH`.
 
-## Installation alternatives
+## Development
 
-**Zero-setup (recommended)**
 ```bash
-npx @mustafagoksever/java-inspector
-```
-
-**Global install**
-```bash
-npm install -g @mustafagoksever/java-inspector
-java-inspector start
-```
-
-**Build from source**
-```bash
-git clone https://github.com/mustafagoksever/java-inspector.git
-cd java-inspector
-npm install
 npm run build
+npm test
+npm run dev
 ```
 
----
-
-## Troubleshooting
-
-### Log Files
-
-All logs are stored in the cache directory under your user home:
-
-```
-~/.cache/java-inspector/<project>_<hash>/server-<pid>.log
-```
-
-**Viewing logs while connected:**
-
-```powershell
-# PowerShell
-Get-Content ~/.cache/java-inspector/<project>_<hash>/server-<pid>.log -Wait -Tail 20
-
-# Unix/macOS
-tail -f ~/.cache/java-inspector/<project>_<hash>/server-<pid>.log
-```
-
-Log files are **cleared when cache is invalidated** (`forceRefresh: true` or hash mismatch).
-
-| Tag | Description |
-|-----|-------------|
-| `[SERVER]` | Server startup/shutdown |
-| `[AUTO-SCAN]` | Automatic scan on startup |
-| `[MAVEN]` | Maven command resolution & classpath building |
-| `[SCAN]` | Background JAR scanning |
-| `[JAVAP]` | `javap` class analysis |
-| `[DECOMPILE]` | Vineflower decompilation |
-| `[TOOL:<name>]` | Tool call entry/exit with duration |
-| `[CACHE]` | Cache invalidation & state |
-| `[LOCK]` | Cross-process lock acquire/release/compromise |
-
-### Common Issues
-
-**"command not found" error**
-- Ensure Node.js and npm are in your PATH.
-
-**Maven not found**
-- Set `MAVEN_HOME` environment variable or ensure Maven is in your PATH.
-- Try using `mvnd` (Maven Daemon) for ~2x faster resolves.
-
-**Lock timeout errors**
-- If a process was killed with SIGKILL while scanning, locks become stale after 60 seconds.
-- Another process can then acquire the lock. No action needed unless the problem persists.
-
-**Cache problems**
-- Call `scan_dependencies` with `forceRefresh: true` to clear cache and restart.
-
----
-
-## Technical stack
-
-| Layer | Technology |
-|-------|------------|
-| Language | TypeScript 5.7 |
-| Runtime | Node.js 16+ |
-| Protocol | Model Context Protocol (MCP) |
-| Decompiler | Vineflower 1.11.2 (bundled) |
-| JAR reader | yauzl (streaming, lazy entries) |
-| Build tool | tsc |
-| Package manager | npm |
-| License | Apache-2.0 |
-
----
-
-## Performance Test Results
-
-### Spring AI Project Test (April 2026)
-
-**Test Environment:** Windows, Maven Daemon (`mvnd`)
-**Project:** Spring AI (multi-module project)
-
-| Operation | Time |
-|-----------|------|
-| Maven classpath resolution (185 JARs) | 44.87s |
-| Background scan (185 JARs, 30,612 classes) | 12.38s |
-| Total initial scan | ~57s |
-| analyze_class (UserMessage) | <1s |
-| decompile_class (UserMessage) | <1s |
-| search_class (query: "UserMessage") | <1s |
-
-**Notes:**
-- First call triggers classpath resolution + background scan (non-blocking)
-- Subsequent calls use cached index (in-memory Map)
-- Cross-process locking prevents duplicate scans
+The project is ES modules and emits JavaScript, declarations, and source maps to `dist/`.
 
 ## License
 

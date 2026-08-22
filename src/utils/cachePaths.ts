@@ -46,3 +46,15 @@ export function getScanStatePath(projectPath: string): string {
 export function getServerLogPath(projectPath: string, pid: number = process.pid): string {
     return path.join(getProjectCacheDir(projectPath), `server-${pid}.log`);
 }
+
+export function getJarIndexesDir(contextPath: string): string {
+    return path.join(getProjectCacheDir(contextPath), 'jar-indexes-v3');
+}
+
+export function getGlobalJarIndexesDir(): string {
+    return path.join(os.homedir(), '.cache', 'java-inspector', '_artifacts-v3');
+}
+
+export function getResultCacheDir(contextPath: string): string {
+    return path.join(getProjectCacheDir(contextPath), 'results-v3');
+}

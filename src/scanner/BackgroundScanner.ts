@@ -2,6 +2,7 @@ import * as path from 'path';
 import * as yauzl from 'yauzl';
 import { projectCache, ClassIndexEntry } from '../cache/ProjectCache.js';
 import { Logger } from '../utils/Logger.js';
+import { jarScanCoordinator } from './JarScanCoordinator.js';
 
 export interface ScanState {
     total: number;
@@ -69,6 +70,8 @@ export class BackgroundScanner {
      * Reset (cancel) any existing scan state for a project.
      */
     reset(projectPath: string): void {
+        const state = this.states.get(projectPath);
+        if (state) state.isComplete = true;
         this.states.delete(projectPath);
     }
 
@@ -90,49 +93,40 @@ export class BackgroundScanner {
             ? new Set<string>(scanState.processedJars ?? [])
             : new Set<string>();
 
-        const batchSize = 20;
-
-        for (let i = 0; i < jarPaths.length; i += batchSize) {
-            if (state.isComplete) break; // Allow early termination
-
-            const batchStart = performance.now();
-            const batch = jarPaths.slice(i, i + batchSize);
-            const batchNum = Math.floor(i / batchSize) + 1;
-            const totalBatches = Math.ceil(jarPaths.length / batchSize);
-            logger.debug(`[SCAN] Processing batch ${batchNum}/${totalBatches} (${batch.length} JARs)...`);
-
-            const results = await Promise.all(
-                batch.map((jar: string) =>
-                    processedJars.has(jar)
-                        ? Promise.resolve<ClassIndexEntry[]>([])
-                        : this.extractClassesFromJarWithTimeout(jar, 30000).catch((err: Error) => {
-                            logger.warn(`[SCAN] Failed to process JAR: ${path.basename(jar)}, error: ${err.message}`);
-                            return [] as ClassIndexEntry[];
-                        })
-                )
-            );
-
-            for (const jar of batch) {
-                processedJars.add(jar);
+        const pending = jarPaths.filter(jar => !processedJars.has(jar));
+        let flushQueue: Promise<void> = Promise.resolve();
+        await Promise.all(pending.map(async jar => {
+            if (state.isComplete) return;
+            let entries: ClassIndexEntry[] = [];
+            try {
+                const index = await jarScanCoordinator.scanLight(jar, projectPath, 'background');
+                entries = index.classes
+                    .filter(entry => !entry.isInner && !entry.isSource)
+                    .map(entry => ({
+                        className: entry.className,
+                        jarPath: index.jarPath,
+                        packageName: entry.packageName,
+                        simpleName: entry.simpleName,
+                    }));
+            } catch (error) {
+                logger.warn(`[SCAN] Failed to process JAR: ${path.basename(jar)}, error: ${error instanceof Error ? error.message : String(error)}`);
             }
 
-            state.processed = processedJars.size;
-            const batchClasses = results.reduce((a: ClassIndexEntry[], b: ClassIndexEntry[]) => a.concat(b), []);
-            const batchDuration = ((performance.now() - batchStart) / 1000).toFixed(2);
-            logger.debug(`[SCAN] Batch ${batchNum}/${totalBatches} complete in ${batchDuration}s. Indexed ${batchClasses.length} classes.`);
+            if (state.isComplete) return;
 
-            // Flush partial index every batch (atomically append)
-            await projectCache.appendToClassIndex(
-                projectPath,
-                batchClasses,
-                batch,
-                jarPaths.length
-            );
+            const flush = flushQueue.then(async () => {
+                if (state.isComplete) return;
+                processedJars.add(jar);
+                state.processed = processedJars.size;
+                await projectCache.appendToClassIndex(projectPath, entries, [jar], jarPaths.length);
+                const progress = state.total > 0 ? Math.floor((state.processed / state.total) * 100) : 100;
+                await onProgress?.(`Processed ${state.processed}/${state.total} JARs`, progress, 100);
+            });
+            flushQueue = flush.catch(() => {});
+            await flush;
+        }));
 
-            const progress = Math.floor((state.processed / state.total) * 100);
-            const msg = `Processed ${state.processed}/${state.total} JARs`;
-            await onProgress?.(msg, progress, 100);
-        }
+        if (state.isComplete) return;
 
         // Mark complete — read the final accumulated index and write it as complete
         const finalIndex = await projectCache.getClassIndex(projectPath);

@@ -5,6 +5,8 @@ import * as fs from 'fs';
 import { JavaClassAnalyzerMCPServer } from './index.js';
 import { Logger } from './utils/Logger.js';
 import { CrossProcessLock } from './utils/CrossProcessLock.js';
+import { getProjectCacheDir } from './utils/cachePaths.js';
+import { jarIndexer } from './scanner/JarIndexer.js';
 
 function createTestProject(): string {
     const dir = path.join(os.tmpdir(), `java-inspector-server-test-${process.pid}-${Date.now()}`);
@@ -21,6 +23,10 @@ async function cleanupTestProject(projectPath: string): Promise<void> {
         // ignore
     }
     try {
+        const cacheDir = getProjectCacheDir(projectPath);
+        if (fs.existsSync(cacheDir)) {
+            fs.rmSync(cacheDir, { recursive: true, force: true });
+        }
         if (fs.existsSync(projectPath)) {
             fs.rmSync(projectPath, { recursive: true, force: true });
         }
@@ -39,6 +45,78 @@ describe('JavaClassAnalyzerMCPServer', () => {
 
     afterEach(async () => {
         delete process.env.NODE_ENV;
+    });
+
+    describe('tool registry', () => {
+        it('exposes the v3 lazy artifact tool set', async () => {
+            const handler = (server as any).server._requestHandlers.get('tools/list');
+            const result = await handler({ method: 'tools/list', params: {} }, {});
+            expect(result.tools.map((tool: any) => tool.name)).toEqual([
+                'scan_project',
+                'find_jar',
+                'inspect_jar',
+                'search_class',
+                'search_code',
+                'find_implementations',
+                'inspect_class',
+                'explain_dependency',
+                'search_resources',
+                'read_resource',
+            ]);
+            const inspectClass = result.tools.find((tool: any) => tool.name === 'inspect_class');
+            expect(inspectClass.inputSchema.properties).not.toHaveProperty('decompilerPath');
+        });
+    });
+
+    describe('v3 selector and extracted class cache', () => {
+        it('defaults an omitted artifact selector to the current workspace', async () => {
+            const selector = await (server as any).selectorFromArgs({}, true);
+            expect(selector.workspacePath).toBe(path.resolve(process.cwd()));
+        });
+
+        it('uses collision-safe paths for equal simple class names in one JAR', async () => {
+            const projectPath = createTestProject();
+            const jarPath = path.resolve('lib', 'vineflower-1.11.2.jar');
+            try {
+                const first = await (server as any).getInspectionClassFile({
+                    className: 'com.first.User', jarPath, packageName: 'com.first', simpleName: 'User', score: 1, origin: 'direct', contextPath: projectPath,
+                }, 'BOOT-INF/classes/com/first/User.class', projectPath, Buffer.from([1]));
+                const second = await (server as any).getInspectionClassFile({
+                    className: 'com.second.User', jarPath, packageName: 'com.second', simpleName: 'User', score: 1, origin: 'direct', contextPath: projectPath,
+                }, 'BOOT-INF/classes/com/second/User.class', projectPath, Buffer.from([2]));
+                expect(first).not.toBe(second);
+                expect(fs.readFileSync(first)).toEqual(Buffer.from([1]));
+                expect(fs.readFileSync(second)).toEqual(Buffer.from([2]));
+            } finally {
+                await cleanupTestProject(projectPath);
+            }
+        });
+
+        it('resolves a superclass located in the same directly selected JAR', async () => {
+            const projectPath = createTestProject();
+            const jarPath = path.resolve('lib', 'vineflower-1.11.2.jar');
+            try {
+                const deep = await jarIndexer.getDeepIndex(jarPath, projectPath);
+                const names = new Set(deep.classes.map(clazz => clazz.className));
+                const child = deep.classes.find(clazz => clazz.superClass && names.has(clazz.superClass));
+                expect(child?.superClass).toBeDefined();
+                const hierarchy = await (server as any).resolveHierarchy({
+                    className: child!.className,
+                    jarPath,
+                    packageName: child!.className.substring(0, child!.className.lastIndexOf('.')),
+                    simpleName: child!.className.substring(child!.className.lastIndexOf('.') + 1),
+                    score: 1,
+                    origin: 'direct',
+                    contextPath: projectPath,
+                }, { jarPath }, projectPath, child!.entryPath);
+                expect(hierarchy).toEqual(expect.arrayContaining([
+                    expect.objectContaining({ className: child!.superClass, resolved: true }),
+                    expect.objectContaining({ className: child!.className, resolved: true }),
+                ]));
+            } finally {
+                await cleanupTestProject(projectPath);
+            }
+        });
     });
 
     describe('applyFilter', () => {

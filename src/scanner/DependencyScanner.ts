@@ -25,6 +25,8 @@ export class DependencyScanner {
     private classpathPromises = new Map<string, Promise<string[]>>();
     private mavenCommand: string | null = null;
     private scanErrors = new Map<string, string>();
+    private activeClasspathResolutions = 0;
+    private classpathResolutionQueue: Array<() => void> = [];
     // Track scan.lock release functions so we can release when scan completes
     private scanLockReleases = new Map<string, () => Promise<void>>();
 
@@ -242,7 +244,7 @@ export class DependencyScanner {
         onProgress?: (message: string, progress?: number, total?: number) => Promise<void>
     ): Promise<void> {
         const logger = Logger.get(projectPath);
-        const promise = this.getBuildClasspath(projectPath, onProgress);
+        const promise = this.withClasspathResolutionSlot(() => this.getBuildClasspath(projectPath, onProgress));
         this.classpathPromises.set(projectPath, promise);
 
         try {
@@ -251,6 +253,14 @@ export class DependencyScanner {
 
             if (jarPaths.length === 0) {
                 logger.warn('[MAVEN] No dependency JARs found after classpath resolution.');
+                const pomHash = await projectCache.getPomHash(projectPath);
+                const classpathHash = projectCache.getClasspathHash([]);
+                await projectCache.saveClasspath(projectPath, [], pomHash);
+                await projectCache.saveClassIndex(projectPath, {
+                    jarCount: 0,
+                    classCount: 0,
+                    sampleEntries: [],
+                }, pomHash, classpathHash);
                 return;
             }
 
@@ -404,6 +414,37 @@ export class DependencyScanner {
      */
     async getClasspath(projectPath: string): Promise<string[] | null> {
         return projectCache.getClasspath(projectPath);
+    }
+
+    async explainDependency(projectPath: string, coordinates: string): Promise<string> {
+        if (!coordinates || /[&|;<>$()]/.test(coordinates)) {
+            throw new Error('coordinates is required and may not contain shell metacharacters');
+        }
+        const mavenCmd = await this.resolveMavenCommand(projectPath);
+        const { stdout, stderr } = await execFileAsync(
+            mavenCmd,
+            ['dependency:tree', `-Dincludes=${coordinates}`, '-Dverbose'],
+            {
+                cwd: projectPath,
+                timeout: 120000,
+                shell: process.platform === 'win32',
+                maxBuffer: 10 * 1024 * 1024,
+            },
+        );
+        return [stdout, stderr].filter(value => value?.trim()).join('\n');
+    }
+
+    private async withClasspathResolutionSlot<T>(task: () => Promise<T>): Promise<T> {
+        if (this.activeClasspathResolutions >= 2) {
+            await new Promise<void>(resolve => this.classpathResolutionQueue.push(resolve));
+        }
+        this.activeClasspathResolutions++;
+        try {
+            return await task();
+        } finally {
+            this.activeClasspathResolutions--;
+            this.classpathResolutionQueue.shift()?.();
+        }
     }
 
     /**

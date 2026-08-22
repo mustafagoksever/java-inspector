@@ -1,7 +1,7 @@
 {
     "name": "@mustafagoksever/java-inspector",
-    "version": "2.4.0",
-    "description": "MCP server that gives AI agents instant access to decompiled Java code from Maven dependencies. Blazing fast Java class analysis for Claude, Cursor, and other LLM-powered IDEs.",
+    "version": "3.0.0",
+    "description": "Lazy, priority-aware Java artifact inspection for AI agents: Maven dependencies, local JARs, bytecode, resources, and JDK source.",
     "main": "dist/index.js",
     "bin": {
         "java-inspector": "dist/cli.js"
@@ -42,6 +42,8 @@
         "spring",
         "spring-boot",
         "jar",
+        "war",
+        "jdk",
         "bytecode",
         "reverse-engineering",
         "class-analyzer",

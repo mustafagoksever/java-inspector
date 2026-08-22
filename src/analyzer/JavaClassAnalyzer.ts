@@ -76,6 +76,38 @@ export class JavaClassAnalyzer {
         }
     }
 
+    async analyzeClassFromJar(className: string, jarPath: string, contextPath: string, verbose: boolean = true): Promise<ClassAnalysis> {
+        return this.analyzeClassWithJavap(jarPath, className, verbose, Logger.get(contextPath));
+    }
+
+    async analyzeClassFile(className: string, classFilePath: string, contextPath: string): Promise<ClassAnalysis> {
+        const output = await this.runJavap(['-v', '-p', classFilePath], Logger.get(contextPath));
+        return this.parseJavapOutput(output, className);
+    }
+
+    async analyzeJdkClass(className: string, contextPath: string): Promise<ClassAnalysis> {
+        const output = await this.runJavap(['-v', className], Logger.get(contextPath));
+        return this.parseJavapOutput(output, className);
+    }
+
+    async getBytecode(className: string, contextPath: string, jarPath?: string): Promise<string> {
+        const args = jarPath
+            ? ['-c', '-l', '-p', '-s', '-cp', jarPath, className]
+            : ['-c', '-l', '-p', '-s', className];
+        return this.runJavap(args, Logger.get(contextPath));
+    }
+
+    async getBytecodeFromClassFile(classFilePath: string, contextPath: string): Promise<string> {
+        return this.runJavap(['-c', '-l', '-p', '-s', classFilePath], Logger.get(contextPath));
+    }
+
+    private async runJavap(args: string[], logger?: Logger): Promise<string> {
+        const javapCmd = this.getJavapCommand(logger);
+        const { stdout, stderr } = await execFileAsync(javapCmd, args, { timeout: 10000, maxBuffer: 10 * 1024 * 1024 });
+        if (stderr?.trim()) logger?.warn(`[JAVAP] stderr: ${stderr}`);
+        return stdout;
+    }
+
     /**
      * Use javap tool to analyze class structure in JAR package
      */
