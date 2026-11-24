@@ -17,13 +17,31 @@ import { projectDiscovery } from './scanner/ProjectDiscovery.js';
 import { ClassFileMetadataReader } from './scanner/ClassFileMetadataReader.js';
 import { getResultCacheDir } from './utils/cachePaths.js';
 import { extractMethod, extractTypeDeclaration } from './utils/methodExtractor.js';
+import { buildOutline, extractMembers, formatOutline, JavapMember, javapMemberAtLine, memberAtLine, memberRangeWithDoc, OutlineMember, parseJavapMembers, selectJavapMembers } from './utils/javaOutline.js';
 import { Logger } from './utils/Logger.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const { version } = JSON.parse(readFileSync(path.resolve(__dirname, '../package.json'), 'utf-8'));
 type Format = 'text' | 'json' | 'toon';
-type SourceSlice = { source: string; sourceRange?: { startLine: number; endLine: number; totalLines: number }; sourceOrigin?: 'embedded-source' | 'sources-jar' | 'decompiled' | 'jdk-src.zip'; enclosingClass?: string; sourceNote?: string };
+type SourceSlice = { source: string; sourceRange?: { startLine: number; endLine: number; totalLines: number }; sourceOrigin?: 'embedded-source' | 'sources-jar' | 'decompiled' | 'jdk-src.zip'; enclosingClass?: string; sourceNote?: string; outline?: string; lineInfo?: string; declaredIn?: string };
+type FullSource = { source: string; sourceOrigin: NonNullable<SourceSlice['sourceOrigin']>; enclosingClass?: string; sourceNote?: string; rawSource: string };
+
+/** Source files longer than this are not returned whole by default: outline + first lines instead. */
+const SOURCE_AUTO_LIMIT = 400;
+const SOURCE_AUTO_PREVIEW = 120;
+/** javap -c output longer than this is replaced by the member list unless methodName/line is given. */
+const BYTECODE_AUTO_LIMIT = 400;
+/** Hard cap for any single tool response (~10k tokens). */
+const MAX_RESPONSE_CHARS = 40_000;
+
+class MemberNotFoundError extends Error {
+    constructor(readonly memberName: string, readonly outline: OutlineMember[], paramTypes?: string[]) {
+        const lower = memberName.toLowerCase();
+        const similar = [...new Set(outline.filter(member => (member.kind === 'method' || member.kind === 'constructor') && member.name.toLowerCase().includes(lower.substring(0, Math.max(3, lower.length - 2)))).map(member => member.signature))].slice(0, 15);
+        super(`Method not found: ${memberName}${paramTypes?.length ? `(${paramTypes.join(', ')})` : ''}.${similar.length ? `\nSimilar members:\n${similar.map(item => `- ${item}`).join('\n')}` : ' Use view=outline to list the members.'}`);
+    }
+}
 type Progress = (message: string, progress?: number, total?: number) => Promise<void>;
 
 /**
@@ -147,17 +165,19 @@ export class JavaClassAnalyzerMCPServer {
             (args, progress) => this.handleFindDuplicates(args, progress));
 
         register('inspect_class', 'Inspect / decompile class',
-            'Show a Java class from a Maven dependency, local JAR, or the JDK. view="source": real source from a -sources.jar if present, otherwise decompiled with Vineflower (nested classes included; ask for Outer$Inner to get only one nested class); pass methodName (and optionally paramTypes) to return a single method, or offset/limit to page large files. ' +
-            'view="api": compact member signatures (replaces `javap -p`). view="bytecode": `javap -c -l -p -s` output. view="hierarchy": superclass chain and interfaces. view="all": everything. ' +
-            'Use this instead of running javap or a decompiler in the shell. For Maven dependencies pass ONLY className: the JAR is found from the project classpath (no need to locate it in ~/.m2). jarPath/jarDirectory are for non-Maven JARs or to pick one of several candidates. Use search_class first if you only know the simple name.',
+            'Read a Java class from a Maven dependency, local JAR, or the JDK. Use instead of javap, unzip or a decompiler in the shell. ' +
+            'view="source": real source from a -sources.jar if present, otherwise decompiled with Vineflower; files over 400 lines return the first lines plus an outline. view="outline": members with line ranges (cheapest way to see a large class). ' +
+            'view="api": compact member signatures (replaces `javap -p`). view="bytecode": `javap -c` (per method with methodName). view="hierarchy": superclass chain and interfaces. view="all": everything. ' +
+            'Efficient pattern: outline (or api) first, then methodName for the code you need. For a stack trace, pass line. For Maven dependencies pass ONLY className: the JAR comes from the project classpath (do not locate it in ~/.m2). Use search_class first if you only know part of the name.',
             {
                 className: z.string().describe('Fully qualified class name, e.g. "com.fasterxml.jackson.databind.ObjectMapper". Nested classes: "com.acme.Outer$Inner" (or "com.acme.Outer.Inner"); view=source then returns just the nested declaration.'),
                 ...SELECTOR,
-                view: z.enum(['source', 'api', 'hierarchy', 'bytecode', 'all']).default('source').describe('Which view to return.'),
-                methodName: z.string().optional().describe('view=source only: return just this method (all overloads unless paramTypes is given).'),
+                view: z.enum(['source', 'outline', 'api', 'hierarchy', 'bytecode', 'all']).default('source').describe('Which view to return.'),
+                methodName: z.string().optional().describe('source/bytecode: return just this method or constructor (all overloads unless paramTypes is given). If the class does not declare it, superclasses and interfaces are searched.'),
                 paramTypes: z.array(z.string()).optional().describe('Simple or qualified parameter type names to select one overload, e.g. ["String", "int"].'),
-                offset: num('view=source: 1-based first line to return (default 1). The response reports totalLines.'),
-                limit: num('view=source: number of lines to return; 0 = all (default 0).'),
+                line: num('Original source line number, e.g. 123 from "at com.acme.Foo.bar(Foo.java:123)": returns the method containing that line (marked when real sources exist; for decompiled code the method is located via the class file line table).'),
+                offset: num('view=source: 1-based first line to return (default 1).'),
+                limit: num(`view=source: number of lines to return. Default: whole file up to ${SOURCE_AUTO_LIMIT} lines; larger files return the first ${SOURCE_AUTO_PREVIEW} lines plus an outline.`),
                 useCache: z.boolean().default(true).describe('Reuse cached decompiled source.'),
                 format: FORMAT,
             },
@@ -236,9 +256,9 @@ export class JavaClassAnalyzerMCPServer {
         const structured = { ...result, jdkResults, backgroundScanProgress: await this.aggregateScanProgress(selector.workspacePath) };
         const totalResults = result.results.length + jdkResults.length;
         let text = totalResults ? `Found ${totalResults} class candidate(s):\n${[
-            ...result.results.map(item => `- ${item.className} -> ${item.jarPath}`),
-            ...jdkResults.map(item => `- ${item.className} -> jdk:${item.module ?? 'unknown-module'}`),
-        ].join('\n')}` : `No class found matching "${args.query}".`;
+            this.groupByJar(result.results, item => item.className),
+            ...jdkResults.map(item => `jdk:${item.module ?? 'unknown-module'}\n  - ${item.className}`),
+        ].filter(Boolean).join('\n')}` : `No class found matching "${args.query}".`;
         if (!result.complete) text += `\n\nSearch is partial; ${result.remainingJarCount} candidate JAR(s) remain.`;
         if (result.errors.length) text += `\n\nScan errors:\n${result.errors.map(error => `- ${error.jarPath ?? error.contextPath ?? 'workspace'}: ${error.message}`).join('\n')}`;
         return this.formatResponse(text, structured, args.format);
@@ -249,7 +269,7 @@ export class JavaClassAnalyzerMCPServer {
         const selector = await this.selectorFromArgs(args, true);
         await sendProgress?.(`Searching deep metadata for ${args.kind}: ${args.query}`, 0, 100);
         const result = await artifactService.searchCode(args.query, args.kind, selector, this.clamp(args.limit, 1, 100, 20), args.mode === 'fast' ? 3 : 10);
-        let text = result.matches.length ? `Found ${result.matches.length} match(es):\n${result.matches.map(item => `- ${item.className}${item.member ? `#${item.member}` : ''} -> ${item.jarPath}`).join('\n')}` : `No ${args.kind} match found for "${args.query}".`;
+        let text = result.matches.length ? `Found ${result.matches.length} match(es):\n${this.groupByJar(result.matches, item => `${item.className}${item.member ? `#${item.member}${item.descriptor ? ` ${item.descriptor}` : ''}` : ''}${item.owner ? ` -> ${item.owner}` : ''}${item.value !== undefined ? ` "${item.value.length > 120 ? `${item.value.substring(0, 117)}...` : item.value}"` : ''}`)}` : `No ${args.kind} match found for "${args.query}".`;
         if (!result.complete) text += `\n\nSearch is partial; ${result.remainingJarCount} JAR(s) remain.`;
         if (result.errors.length) text += `\n${result.errors.map(error => `- ${error.jarPath ?? error.contextPath ?? 'workspace'}: ${error.message}`).join('\n')}`;
         return this.formatResponse(text, result, args.format);
@@ -260,7 +280,7 @@ export class JavaClassAnalyzerMCPServer {
         const selector = await this.selectorFromArgs(args, true);
         await sendProgress?.(`Finding implementations of ${args.className}`, 0, 100);
         const result = await artifactService.findImplementations(args.className, selector, args.transitive !== false, this.clamp(args.limit, 1, 200, 50), args.mode === 'fast' ? 3 : 10);
-        let text = result.implementations.length ? `Found ${result.implementations.length} implementation(s):\n${result.implementations.map(item => `- ${item.className} -> ${item.jarPath}`).join('\n')}` : `No implementations found for ${args.className}${result.complete ? '.' : ' in the currently deep-indexed JARs.'}`;
+        let text = result.implementations.length ? `Found ${result.implementations.length} implementation(s):\n${this.groupByJar(result.implementations, item => item.className)}` : `No implementations found for ${args.className}${result.complete ? '.' : ' in the currently deep-indexed JARs.'}`;
         if (!result.complete && result.remainingJarCount > 0) text += `\n\nSearch is partial; ${result.remainingJarCount} JAR(s) not deep-indexed yet. Call again to continue, or narrow with jarNamePrefix.`;
         if (result.errors.length) text += `\n${result.errors.map(error => `- ${error.jarPath ?? error.contextPath ?? 'workspace'}: ${error.message}`).join('\n')}`;
         return this.formatResponse(text, result, args.format);
@@ -345,34 +365,37 @@ export class JavaClassAnalyzerMCPServer {
             if (!classEntry) throw new Error(`Binary class not found for source: ${candidate.className}`);
         }
         const result: any = { className: candidate.className, jarPath: candidate.jarPath, entryPath: classEntry.entryPath, origin: candidate.origin, backgroundSearchComplete: resolved.complete };
-        if (view === 'source' || view === 'all') {
-            await sendProgress?.('Loading source/decompiling class', 35, 100);
-            Object.assign(result, await this.loadClassSource(candidate, classEntry.entryPath, contextPath, args));
-        }
-        const normalEntryPath = `${candidate.className.replace(/\./g, '/')}.class`;
-        const needsExtractedClass = classEntry.entryPath !== normalEntryPath;
+        const entryPath = classEntry.entryPath;
+        const needsExtractedClass = entryPath !== `${candidate.className.replace(/\./g, '/')}.class`;
         let inspectionClassFile: string | undefined;
+        const classFile = async (bytes?: Buffer) => {
+            if (needsExtractedClass && !inspectionClassFile) inspectionClassFile = await this.getInspectionClassFile(candidate, entryPath, contextPath, bytes);
+            return inspectionClassFile;
+        };
+        let bytecodeOutput: Promise<string> | undefined;
+        const bytecode = () => bytecodeOutput ??= classFile().then(file => file
+            ? this.analyzer.getBytecodeFromClassFile(file, contextPath)
+            : this.analyzer.getBytecode(candidate.className, contextPath, candidate.jarPath));
+        const javapMembers = async () => parseJavapMembers(await bytecode(), candidate.className).members;
+        if (view === 'source' || view === 'all' || view === 'outline') {
+            await sendProgress?.('Loading source/decompiling class', 35, 100);
+            if (view === 'outline') Object.assign(result, await this.loadClassOutline(candidate, entryPath, contextPath, args));
+            else Object.assign(result, await this.loadClassSource(candidate, entryPath, contextPath, args, selector, classEntry.isSource ? undefined : javapMembers));
+        }
         if (view === 'api' || view === 'all') {
-            const bytes = await jarIndexer.readEntry(candidate.jarPath, classEntry.entryPath, 20 * 1024 * 1024);
+            const bytes = await jarIndexer.readEntry(candidate.jarPath, entryPath, 20 * 1024 * 1024);
             const classFileMetadata = ClassFileMetadataReader.read(bytes);
-            if (needsExtractedClass) inspectionClassFile = await this.getInspectionClassFile(candidate, classEntry.entryPath, contextPath, bytes);
-            const signatures = await this.analyzer.getSignatures(candidate.className, contextPath, inspectionClassFile ? { classFile: inspectionClassFile } : { jarPath: candidate.jarPath });
+            const file = await classFile(bytes);
+            const signatures = await this.analyzer.getSignatures(candidate.className, contextPath, file ? { classFile: file } : { jarPath: candidate.jarPath });
             result.api = {
                 signatures: signatures.trim(),
                 superClass: classFileMetadata.superClass,
                 interfaces: classFileMetadata.interfaces,
                 accessFlags: classFileMetadata.accessFlags,
-                fields: classFileMetadata.fields,
-                methods: classFileMetadata.methods,
             };
         }
-        if (view === 'hierarchy' || view === 'all') result.hierarchy = await this.resolveHierarchy(candidate, selector, contextPath, classEntry.entryPath);
-        if (view === 'bytecode' || view === 'all') {
-            if (needsExtractedClass && !inspectionClassFile) inspectionClassFile = await this.getInspectionClassFile(candidate, classEntry.entryPath, contextPath);
-            result.bytecode = inspectionClassFile
-                ? await this.analyzer.getBytecodeFromClassFile(inspectionClassFile, contextPath)
-                : await this.analyzer.getBytecode(candidate.className, contextPath, candidate.jarPath);
-        }
+        if (view === 'hierarchy' || view === 'all') result.hierarchy = await this.resolveHierarchy(candidate, selector, contextPath, entryPath);
+        if (view === 'bytecode' || view === 'all') Object.assign(result, this.bytecodeView(await bytecode(), candidate.className, args));
         await sendProgress?.('Class inspection complete', 100, 100);
         return this.formatResponse(this.classInspectionText(candidate.className, result), result, args.format);
     }
@@ -412,24 +435,191 @@ export class JavaClassAnalyzerMCPServer {
         return this.formatResponse(`Resource ${result.resourcePath} (${result.startLine}-${result.endLine}/${result.totalLines}):\n\n${result.text}`, result, args.format);
     }
 
-    private async loadClassSource(candidate: ClassCandidate, entryPath: string, contextPath: string, args: any): Promise<SourceSlice> {
+    /** Full source of the class (for nested classes: just the nested declaration), plus the outer raw source. */
+    private async loadFullSource(candidate: ClassCandidate, entryPath: string, contextPath: string, args: any): Promise<FullSource> {
         const dollar = candidate.className.indexOf('$', candidate.className.lastIndexOf('.') + 1);
         if (dollar < 0) {
             const raw = await this.loadRawSource(candidate, entryPath, contextPath, args);
-            return { ...this.sliceSource(raw.source, args), sourceOrigin: raw.sourceOrigin };
+            return { ...raw, rawSource: raw.source };
         }
         // Nested class: sources and Vineflower output live in the top-level class; cut out the nested declaration.
         const outerClassName = candidate.className.substring(0, dollar);
         const outerEntryPath = entryPath.replace(/\$[^/]*(\.class|\.java)$/i, '$1');
         const raw = await this.loadRawSource({ ...candidate, className: outerClassName }, outerEntryPath, contextPath, args);
-        const names = candidate.className.substring(dollar + 1).split('$');
-        const nested = extractTypeDeclaration(raw.source, names);
-        if (nested) return { ...this.sliceSource(nested, args), sourceOrigin: raw.sourceOrigin, enclosingClass: outerClassName };
+        const nested = extractTypeDeclaration(raw.source, candidate.className.substring(dollar + 1).split('$'));
+        if (nested) return { source: nested, sourceOrigin: raw.sourceOrigin, enclosingClass: outerClassName, rawSource: raw.source };
         return {
-            ...this.sliceSource(raw.source, args),
+            source: raw.source,
+            rawSource: raw.source,
             sourceOrigin: raw.sourceOrigin,
             enclosingClass: outerClassName,
             sourceNote: `${candidate.className} is an anonymous/local or synthetic class; showing the source of ${outerClassName}. Use view=bytecode for its exact code.`,
+        };
+    }
+
+    private async loadClassSource(candidate: ClassCandidate, entryPath: string, contextPath: string, args: any, selector: ArtifactSelector, javapMembers?: () => Promise<JavapMember[]>): Promise<SourceSlice> {
+        const full = await this.loadFullSource(candidate, entryPath, contextPath, args);
+        const meta = { sourceOrigin: full.sourceOrigin, ...(full.enclosingClass ? { enclosingClass: full.enclosingClass } : {}), ...(full.sourceNote ? { sourceNote: full.sourceNote } : {}) };
+        if (args.line) return { ...meta, ...await this.sourceAtLine(full.rawSource, full.sourceOrigin, Number(args.line), candidate.className, javapMembers) };
+        try {
+            const slice = this.sliceSource(full.source, args);
+            return { ...meta, ...slice, sourceNote: [meta.sourceNote, slice.sourceNote].filter(Boolean).join(' ') || undefined };
+        } catch (error) {
+            if (!(error instanceof MemberNotFoundError)) throw error;
+            const inherited = await this.inheritedMemberSource(candidate, entryPath, contextPath, args, selector);
+            if (!inherited) throw error;
+            return inherited;
+        }
+    }
+
+    private async loadClassOutline(candidate: ClassCandidate, entryPath: string, contextPath: string, args: any): Promise<any> {
+        const full = await this.loadFullSource(candidate, entryPath, contextPath, args);
+        const members = buildOutline(full.source);
+        return {
+            sourceOrigin: full.sourceOrigin,
+            ...(full.enclosingClass ? { enclosingClass: full.enclosingClass } : {}),
+            ...(full.sourceNote ? { sourceNote: full.sourceNote } : {}),
+            totalLines: full.source.split('\n').length,
+            memberCount: members.length,
+            outline: formatOutline(members),
+        };
+    }
+
+    /**
+     * methodName was not declared in the class: walk superclasses and interfaces (breadth-first) and
+     * return the first declaration found, so "where does getBean() come from?" needs one call.
+     */
+    private async inheritedMemberSource(candidate: ClassCandidate, entryPath: string, contextPath: string, args: any, selector: ArtifactSelector): Promise<SourceSlice | null> {
+        const parentsOf = async (jarPath: string | undefined, entry: string | undefined, className: string): Promise<string[]> => {
+            try {
+                if (jdkSourceService.isLikelyJdkClass(className)) {
+                    const analysis = await this.analyzer.analyzeJdkClass(className, contextPath);
+                    return [analysis.superClass, ...analysis.interfaces].filter(Boolean) as string[];
+                }
+                if (!jarPath || !entry || entry.endsWith('.java')) return [];
+                const metadata = ClassFileMetadataReader.read(await jarIndexer.readEntry(jarPath, entry, 20 * 1024 * 1024));
+                return [metadata.superClass, ...metadata.interfaces].filter(Boolean) as string[];
+            } catch { return []; }
+        };
+        const queue = (await parentsOf(candidate.jarPath, entryPath, candidate.className)).filter(name => name !== 'java.lang.Object');
+        const visited = new Set<string>([candidate.className]);
+        while (queue.length && visited.size < 25) {
+            const parent = queue.shift()!;
+            if (visited.has(parent)) continue;
+            visited.add(parent);
+            try {
+                let source: string | null = null;
+                let origin: NonNullable<SourceSlice['sourceOrigin']> = 'jdk-src.zip';
+                let parentJar: string | undefined;
+                let parentEntry: string | undefined;
+                if (jdkSourceService.isLikelyJdkClass(parent)) {
+                    source = await this.jdkClassSource(parent);
+                } else {
+                    const sameJar = (await jarIndexer.getLightIndex(candidate.jarPath, contextPath)).classes.find(item => item.className === parent && !item.isSource);
+                    const located = sameJar
+                        ? { ...candidate, className: parent, entryPath: sameJar.entryPath }
+                        : (await artifactService.resolveClass(parent, selector.workspacePath ? { workspacePath: selector.workspacePath } : selector)).results.find(item => item.className === parent);
+                    if (located) {
+                        parentJar = located.jarPath;
+                        parentEntry = located.entryPath ?? (await jarIndexer.getLightIndex(located.jarPath, contextPath)).classes.find(item => item.className === parent && !item.isSource)?.entryPath;
+                        if (parentEntry) {
+                            const full = await this.loadFullSource(located, parentEntry, contextPath, args);
+                            source = full.source;
+                            origin = full.sourceOrigin;
+                        }
+                    }
+                }
+                if (source) {
+                    const members = extractMembers(source, args.methodName, args.paramTypes);
+                    if (members.length) {
+                        return {
+                            source: members.map(member => member.text).join('\n\n// ===== Method Overload =====\n\n'),
+                            sourceOrigin: origin,
+                            declaredIn: parent,
+                            lineInfo: `${args.methodName} is not declared in ${candidate.className}; inherited from ${parent}${parentJar ? ` (${path.basename(parentJar)})` : ''}.`,
+                        };
+                    }
+                }
+                for (const grandParent of await parentsOf(parentJar, parentEntry, parent)) {
+                    if (grandParent !== 'java.lang.Object' && !visited.has(grandParent)) queue.push(grandParent);
+                }
+            } catch { /* unresolved parent: keep walking the others */ }
+        }
+        return null;
+    }
+
+    /** Stack-trace style lookup: show the member that contains original source line `line`. */
+    private async sourceAtLine(source: string, sourceOrigin: NonNullable<SourceSlice['sourceOrigin']>, line: number, className: string, javapMembers?: () => Promise<JavapMember[]>): Promise<SourceSlice> {
+        if (!Number.isInteger(line) || line < 1) throw new Error('line must be a positive integer (the line number from a stack trace).');
+        const lines = source.split('\n');
+        const outline = buildOutline(source);
+        if (sourceOrigin !== 'decompiled') {
+            if (line > lines.length) throw new Error(`line ${line} is past the end of the source (${lines.length} lines). Is the dependency version the one from the stack trace?`);
+            const member = memberAtLine(outline, line);
+            let range = member ? memberRangeWithDoc(lines, member) : { start: Math.max(1, line - 20), end: Math.min(lines.length, line + 20) };
+            if (range.end - range.start > 300) range = { start: Math.max(range.start, line - 60), end: Math.min(range.end, line + 60) };
+            return {
+                source: this.numberLines(lines, range.start, range.end, line),
+                sourceRange: { startLine: range.start, endLine: range.end, totalLines: lines.length },
+                lineInfo: `Line ${line} (marked >>) is in ${member ? member.signature : 'the class body (no enclosing method)'}.`,
+            };
+        }
+        if (!javapMembers) throw new Error('Line lookup in decompiled source needs the class file.');
+        const members = await javapMembers();
+        const hit = javapMemberAtLine(members, line);
+        if (!hit) {
+            const all = members.flatMap(member => member.lines);
+            throw new Error(all.length
+                ? `Line ${line} is not in ${className} (its code spans original lines ${Math.min(...all)}-${Math.max(...all)}). Check the class in the stack trace: lambdas/anonymous/inner classes appear as Outer$1, Outer$Inner, and a different dependency version shifts lines.`
+                : `${className} was compiled without line numbers (no LineNumberTable); use methodName instead.`);
+        }
+        let name = hit.name;
+        let paramTypes: string[] | undefined = hit.paramTypes.map(type => type.replace(/<.*>/g, ''));
+        let where = hit.signature.replace(/;$/, '');
+        const lambda = name.match(/^lambda\$(.+)\$\d+$/);
+        if (lambda) { name = lambda[1]; paramTypes = undefined; where = `a lambda inside ${name}()`; }
+        const simple = className.substring(className.lastIndexOf('.') + 1).split('$').pop()!;
+        const ownMembers = outline.filter(member => member.owner[member.owner.length - 1] === simple);
+        const scope = ownMembers.length ? ownMembers : outline;
+        let found: { text: string } | undefined;
+        if (name === '<clinit>') {
+            const init = scope.find(member => member.kind === 'initializer');
+            if (init) { const range = memberRangeWithDoc(lines, init); found = { text: lines.slice(range.start - 1, range.end).join('\n') }; }
+        } else {
+            const memberName = name === '<init>' ? simple : name;
+            found = extractMembers(source, memberName, paramTypes, scope)[0] ?? extractMembers(source, memberName, undefined, scope)[0];
+        }
+        if (!found) return { source: hit.text, lineInfo: `Original line ${line} is in ${where}; it could not be located in the decompiled source, showing its bytecode instead.` };
+        return { source: found.text, lineInfo: `Original line ${line} is in ${where}. The source is decompiled, so its line numbers differ from the stack trace; the whole member is shown.` };
+    }
+
+    private numberLines(lines: string[], start: number, end: number, mark: number): string {
+        const width = String(end).length;
+        return lines.slice(start - 1, end).map((text, index) => {
+            const number = start + index;
+            return `${number === mark ? '>>' : '  '} ${String(number).padStart(width)} | ${text}`;
+        }).join('\n');
+    }
+
+    private bytecodeView(output: string, className: string, args: any): { bytecode: string; bytecodeNote?: string } {
+        const parsed = parseJavapMembers(output, className);
+        if (args.methodName) {
+            const selected = selectJavapMembers(parsed.members, args.methodName, args.paramTypes, className);
+            if (!selected.length) {
+                const names = [...new Set(parsed.members.filter(member => member.isMethod).map(member => member.name))];
+                throw new Error(`Method not found in bytecode: ${args.methodName}. Methods: ${names.slice(0, 60).join(', ')}${names.length > 60 ? ', ...' : ''}`);
+            }
+            return { bytecode: selected.map(member => member.text).join('\n\n') };
+        }
+        if (args.line) {
+            const member = javapMemberAtLine(parsed.members, Number(args.line));
+            if (member) return { bytecode: member.text, bytecodeNote: `Line ${args.line} is in ${member.signature.replace(/;$/, '')}.` };
+        }
+        const lineCount = output.split('\n').length;
+        if (lineCount <= BYTECODE_AUTO_LIMIT) return { bytecode: output.trim() };
+        return {
+            bytecode: `${parsed.header}\n${parsed.members.map(member => `  ${member.signature}`).join('\n')}\n}`,
+            bytecodeNote: `Full bytecode is ${lineCount} lines; only member signatures are listed. Pass methodName (and paramTypes) for one method's bytecode, or line for the method at a stack-trace line.`,
         };
     }
 
@@ -450,34 +640,62 @@ export class JavaClassAnalyzerMCPServer {
     }
 
     private sliceSource(source: string, args: any): SourceSlice {
-        if (args.methodName) {
-            const extracted = extractMethod(source, args.methodName, args.paramTypes);
-            if (!extracted) throw new Error(`Method not found: ${args.methodName}${args.paramTypes ? `(${args.paramTypes.join(', ')})` : ''}. Use view=api to list the declared methods.`);
-            return { source: extracted };
-        }
         const lines = source.split('\n');
         const totalLines = lines.length;
+        if (args.methodName) {
+            const outline = buildOutline(source);
+            const members = extractMembers(source, args.methodName, args.paramTypes, outline);
+            if (members.length) {
+                return {
+                    source: members.map(member => member.text).join('\n\n// ===== Method Overload =====\n\n'),
+                    lineInfo: members.length === 1 ? `Lines ${members[0].start}-${members[0].end} of ${totalLines}.` : `${members.length} overloads.`,
+                };
+            }
+            const extracted = extractMethod(source, args.methodName, args.paramTypes);
+            if (extracted) return { source: extracted };
+            throw new MemberNotFoundError(args.methodName, outline, args.paramTypes);
+        }
         const offset = this.clamp(args.offset, 1, Number.MAX_SAFE_INTEGER, 1);
         const requestedLimit = Number(args.limit ?? 0);
-        if (offset === 1 && !(requestedLimit > 0)) return { source };
+        if (offset === 1 && !(requestedLimit > 0)) {
+            if (totalLines <= SOURCE_AUTO_LIMIT) return { source };
+            // Large file: never dump it whole. First lines + member outline; the agent then reads one member.
+            return {
+                source: lines.slice(0, SOURCE_AUTO_PREVIEW).join('\n'),
+                sourceRange: { startLine: 1, endLine: SOURCE_AUTO_PREVIEW, totalLines },
+                outline: formatOutline(buildOutline(source)),
+                sourceNote: `Large file (${totalLines} lines): showing lines 1-${SOURCE_AUTO_PREVIEW} and the member outline. Read a member with methodName, or a range with offset/limit using the outline's line numbers.`,
+            };
+        }
         if (offset > totalLines) throw new Error(`offset ${offset} is past the end of the source (${totalLines} lines).`);
         const end = requestedLimit > 0 ? Math.min(totalLines, offset - 1 + requestedLimit) : totalLines;
         return { source: lines.slice(offset - 1, end).join('\n'), sourceRange: { startLine: offset, endLine: end, totalLines } };
     }
 
+    private async jdkClassSource(className: string): Promise<string | null> {
+        const dollar = className.indexOf('$');
+        const outerName = dollar > 0 ? className.substring(0, dollar) : className;
+        const outerSource = await jdkSourceService.getSource(outerName);
+        if (!outerSource || dollar < 0) return outerSource;
+        return extractTypeDeclaration(outerSource, className.substring(dollar + 1).split('$')) ?? outerSource;
+    }
+
     private async inspectJdkClass(className: string, contextPath: string, view: string, args: any): Promise<any> {
         const result: any = { className, origin: 'jdk' };
-        if (view === 'source' || view === 'all') {
-            const dollar = className.indexOf('$');
-            const outerName = dollar > 0 ? className.substring(0, dollar) : className;
-            const outerSource = await jdkSourceService.getSource(outerName);
-            const nested = outerSource && dollar > 0 ? extractTypeDeclaration(outerSource, className.substring(dollar + 1).split('$')) : null;
-            const source = nested ?? outerSource;
-            if (source) Object.assign(result, this.sliceSource(source, args), { sourceOrigin: 'jdk-src.zip' }, dollar > 0 ? { enclosingClass: outerName } : {}); else result.sourceUnavailable = true;
+        const dollar = className.indexOf('$');
+        let bytecodeOutput: Promise<string> | undefined;
+        const bytecode = () => bytecodeOutput ??= this.analyzer.getBytecode(className, contextPath);
+        if (view === 'source' || view === 'all' || view === 'outline') {
+            const source = args.line && dollar > 0 ? await jdkSourceService.getSource(className.substring(0, dollar)) : await this.jdkClassSource(className);
+            if (!source) result.sourceUnavailable = true;
+            else if (view === 'outline') Object.assign(result, { sourceOrigin: 'jdk-src.zip', outline: formatOutline(buildOutline(source)), totalLines: source.split('\n').length });
+            else if (args.line) Object.assign(result, await this.sourceAtLine(source, 'jdk-src.zip', Number(args.line), className), { sourceOrigin: 'jdk-src.zip' });
+            else Object.assign(result, this.sliceSource(source, args), { sourceOrigin: 'jdk-src.zip' });
+            if (source && dollar > 0) result.enclosingClass = className.substring(0, dollar);
         }
         if (view === 'api' || view === 'all') result.api = { signatures: (await this.analyzer.getSignatures(className, contextPath)).trim() };
         if (view === 'hierarchy' || view === 'all') result.hierarchy = await this.resolveJdkHierarchy(className, contextPath);
-        if (view === 'bytecode' || view === 'all') result.bytecode = await this.analyzer.getBytecode(className, contextPath);
+        if (view === 'bytecode' || view === 'all') Object.assign(result, this.bytecodeView(await bytecode(), className, args));
         return result;
     }
 
@@ -559,10 +777,15 @@ export class JavaClassAnalyzerMCPServer {
         if (result.enclosingClass) text += `\nEnclosing class: ${result.enclosingClass}`;
         if (result.sourceNote) text += `\nNote: ${result.sourceNote}`;
         if (result.sourceRange) text += `\nLines: ${result.sourceRange.startLine}-${result.sourceRange.endLine} of ${result.sourceRange.totalLines}${result.sourceRange.endLine < result.sourceRange.totalLines ? ` (call again with offset=${result.sourceRange.endLine + 1} for more)` : ''}`;
-        if (result.sourceUnavailable) text += '\n\nSource: unavailable (JDK src.zip not found; use view=api or view=bytecode).';
+        if (result.lineInfo) text += `\n${result.lineInfo}`;
+        if (result.declaredIn) text += `\nDeclared in: ${result.declaredIn}`;
+        if (result.totalLines && result.outline && !result.source) text += `\nLines: ${result.totalLines}`;
+        if (result.sourceUnavailable) text += '\n\nSource: unavailable - the JDK has no lib/src.zip (install the JDK source package, e.g. openjdk-<version>-source, or a JDK that ships src.zip). view=api and view=bytecode still work.';
         if (result.source) text += `\n\nSource:\n\n\`\`\`java\n${result.source}\n\`\`\``;
+        if (result.outline) text += `\n\nOutline (line ranges; read a member with methodName or offset/limit):\n\n\`\`\`text\n${result.outline}\n\`\`\``;
         if (result.api) text += `\n\nAPI (javap -p):\n\n\`\`\`text\n${result.api.signatures}\n\`\`\``;
         if (result.hierarchy) text += `\n\nHierarchy (root first):\n${result.hierarchy.map((item: HierarchyEntry) => `${'  '.repeat(item.level)}${item.className}${item.resolved ? '' : ' (unresolved)'}${item.interfaces?.length ? ` implements ${item.interfaces.join(', ')}` : ''}`).join('\n')}`;
+        if (result.bytecodeNote) text += `\n\n${result.bytecodeNote}`;
         if (result.bytecode) text += `\n\nBytecode:\n\n\`\`\`text\n${result.bytecode}\n\`\`\``;
         return text;
     }
@@ -615,10 +838,29 @@ export class JavaClassAnalyzerMCPServer {
     }
 
     private formatResponse(text: string, structured: object, format: Format = 'text'): { content: Array<{ type: 'text'; text: string }> } {
-        const wrap = (value: string) => ({ content: [{ type: 'text' as const, text: value }] });
+        const wrap = (value: string) => ({ content: [{ type: 'text' as const, text: this.capResponse(value) }] });
         if (format === 'json') return wrap(JSON.stringify(structured, null, 2));
         if (format === 'toon') { try { return wrap(toonEncode(structured)); } catch { return wrap(text); } }
         return wrap(text);
+    }
+
+    /** Text lists grouped under their JAR, so long Maven paths are printed once instead of per line. */
+    private groupByJar<T extends { jarPath: string }>(items: T[], render: (item: T) => string): string {
+        const groups = new Map<string, string[]>();
+        for (const item of items) {
+            if (!groups.has(item.jarPath)) groups.set(item.jarPath, []);
+            groups.get(item.jarPath)!.push(`  - ${render(item)}`);
+        }
+        return [...groups].map(([jarPath, lines]) => `${jarPath}\n${lines.join('\n')}`).join('\n');
+    }
+
+    /** Last-resort guard: no single response may flood the agent's context. */
+    private capResponse(text: string): string {
+        if (text.length <= MAX_RESPONSE_CHARS) return text;
+        const cut = text.lastIndexOf('\n', MAX_RESPONSE_CHARS);
+        const kept = text.substring(0, cut > MAX_RESPONSE_CHARS * 0.8 ? cut : MAX_RESPONSE_CHARS);
+        const fence = (kept.match(/```/g)?.length ?? 0) % 2 === 1 ? '\n```' : '';
+        return `${kept}${fence}\n\n[Response truncated at ${MAX_RESPONSE_CHARS} of ${text.length} characters. Narrow the request: methodName/line/offset+limit for source, methodName for bytecode, a smaller limit or a more specific query for searches.]`;
     }
 
     private clamp(value: unknown, min: number, max: number, fallback: number): number {

@@ -112,11 +112,72 @@ describe('JavaClassAnalyzerMCPServer', () => {
         }, 60_000);
     });
 
+    describe('context-efficient class views', () => {
+        const callTool = async (name: string, args: Record<string, unknown>) => {
+            const handler = (server as any).server._requestHandlers.get('tools/call');
+            return handler({ method: 'tools/call', params: { name, arguments: args } }, { signal: new AbortController().signal, sendNotification: async () => {}, sendRequest: async () => ({}) });
+        };
+        const jarPath = path.resolve('lib', 'vineflower-1.12.0.jar');
+        const consoleDecompiler = 'org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler';
+
+        it('returns an outline with line ranges', async () => {
+            const result = await callTool('inspect_class', { className: consoleDecompiler, jarPath, view: 'outline' });
+            expect(result.isError).toBeFalsy();
+            expect(result.content[0].text).toMatch(/Outline/);
+            expect(result.content[0].text).toMatch(/L\d+-\d+ +public static void main\(String\[\] args\)/);
+        }, 60_000);
+
+        it('finds the method containing a stack-trace line via the class line table', async () => {
+            const result = await callTool('inspect_class', { className: consoleDecompiler, jarPath, line: 286 });
+            expect(result.isError).toBeFalsy();
+            expect(result.content[0].text).toMatch(/Original line 286 is in public void saveFolder\(java\.lang\.String\)/);
+            expect(result.content[0].text).toMatch(/public void saveFolder\(String path\)/);
+        }, 60_000);
+
+        it('returns one method of bytecode and lists members instead of dumping large bytecode', async () => {
+            const one = await callTool('inspect_class', { className: consoleDecompiler, jarPath, view: 'bytecode', methodName: 'saveFolder' });
+            expect(one.content[0].text).toMatch(/public void saveFolder\(java\.lang\.String\);/);
+            expect(one.content[0].text).not.toMatch(/public static void main/);
+            const all = await callTool('inspect_class', { className: consoleDecompiler, jarPath, view: 'bytecode' });
+            expect(all.content[0].text).toMatch(/only member signatures are listed/);
+            expect(all.content[0].text.length).toBeLessThan(20_000);
+        }, 60_000);
+
+        it('looks up inherited methods in superclasses and interfaces', async () => {
+            const result = await callTool('inspect_class', { className: 'org.jetbrains.java.decompiler.main.decompiler.DirectoryResultSaver', jarPath, methodName: 'getCodeLineData' });
+            expect(result.isError).toBeFalsy();
+            expect(result.content[0].text).toMatch(/Declared in: org\.jetbrains\.java\.decompiler\.main\.extern\.IResultSaver/);
+            expect(result.content[0].text).toMatch(/default byte\[\] getCodeLineData/);
+        }, 60_000);
+
+        it('groups search results under their JAR', async () => {
+            const result = await callTool('search_class', { query: 'ResultSaver', jarPath });
+            const text = result.content[0].text;
+            expect(text.split(jarPath).length - 1).toBe(1);
+            expect(text).toMatch(/\n  - org\.jetbrains\.java\.decompiler\.main\.decompiler\.DirectoryResultSaver/);
+        }, 60_000);
+    });
+
     describe('sliceSource', () => {
         const source = ['a', 'b', 'c', 'd', 'e'].join('\n');
 
         it('returns the full source without a range by default', () => {
             expect((server as any).sliceSource(source, {})).toEqual({ source });
+        });
+
+        it('returns the first lines plus an outline for large files instead of everything', () => {
+            const big = ['public class Big {', ...Array.from({ length: 500 }, (_, index) => `    public int m${index}() { return ${index}; }`), '}'].join('\n');
+            const slice = (server as any).sliceSource(big, {});
+            expect(slice.source.split('\n')).toHaveLength(120);
+            expect(slice.sourceRange).toEqual({ startLine: 1, endLine: 120, totalLines: 502 });
+            expect(slice.outline).toMatch(/L401 +public int m399\(\)/);
+            expect((server as any).sliceSource(big, { limit: 600 }).source).toBe(big);
+        });
+
+        it('caps oversized responses with a hint', () => {
+            const capped = (server as any).capResponse('x'.repeat(10) + '\n' + 'y'.repeat(50_000));
+            expect(capped.length).toBeLessThan(41_000);
+            expect(capped).toMatch(/Response truncated/);
         });
 
         it('reports the returned range and total lines when paging', () => {
