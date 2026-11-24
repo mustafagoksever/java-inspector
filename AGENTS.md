@@ -41,7 +41,7 @@ TypeScript MCP server that decompiles Java classes from Maven dependencies using
 - `tsconfig.json` excludes `**/*.test.ts`
 
 ## Bundled Vineflower JAR — do not break
-- The repo ships `lib/vineflower-1.11.2.jar` (~1.8 MB)
+- The repo ships `lib/vineflower-1.12.0.jar` (~1.6 MB)
 - `.gitignore` has `lib/vineflower-*.jar` **and** `!lib/vineflower-*.jar` to allow tracking the shipped JAR
 - `DecompilerService.findVineflowerJar()` resolution order:
   1. `DECOMPILER_PATH` env var

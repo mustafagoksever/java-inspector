@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Bundled Vineflower updated from 1.11.2 to 1.12.0 (`lib/vineflower-1.12.0.jar`, requires Java 17+ like before). The decompile cache key now includes the decompiler version and extraction scheme, so cached output from older runs is not reused.
 - Migrated to `@modelcontextprotocol/sdk` 1.32 (`McpServer.registerTool`, protocol 2025-11-25). Tool input schemas are now zod-validated and every parameter has a description.
 - The server now sends `instructions` in the initialize response and every tool has `title` and read-only `annotations`. Tool descriptions say explicitly which shell commands they replace (`javap`, `unzip -l`, `jar tf`, `find ~/.m2`, `mvn dependency:tree`), so agents pick them without being told to.
 - `inspect_class` `view: "api"` now returns compact `javap -p` signatures (all visibilities, generic signatures) instead of a large JSON dump that omitted fields and non-public members.

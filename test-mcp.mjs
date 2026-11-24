@@ -4,7 +4,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import * as path from "path";
 
 const workspacePath = path.resolve(process.argv[2] ?? process.cwd());
-const jarPath = path.resolve("lib/vineflower-1.11.2.jar");
+const jarPath = path.resolve("lib/vineflower-1.12.0.jar");
 const className = "org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler";
 
 const transport = new StdioClientTransport({

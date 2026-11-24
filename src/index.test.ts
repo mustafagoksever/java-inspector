@@ -90,7 +90,7 @@ describe('JavaClassAnalyzerMCPServer', () => {
         });
 
         it('does not silently resolve a misspelled class to a fuzzy match', async () => {
-            const jarPath = path.resolve('lib', 'vineflower-1.11.2.jar');
+            const jarPath = path.resolve('lib', 'vineflower-1.12.0.jar');
             const result = await callTool('inspect_class', { className: 'org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompile', jarPath, view: 'hierarchy' });
             expect(result.isError).toBe(true);
             expect(result.content[0].text).toMatch(/Class not found/);
@@ -122,7 +122,7 @@ describe('JavaClassAnalyzerMCPServer', () => {
 
         it('uses collision-safe paths for equal simple class names in one JAR', async () => {
             const projectPath = createTestProject();
-            const jarPath = path.resolve('lib', 'vineflower-1.11.2.jar');
+            const jarPath = path.resolve('lib', 'vineflower-1.12.0.jar');
             try {
                 const first = await (server as any).getInspectionClassFile({
                     className: 'com.first.User', jarPath, packageName: 'com.first', simpleName: 'User', score: 1, origin: 'direct', contextPath: projectPath,
@@ -140,7 +140,7 @@ describe('JavaClassAnalyzerMCPServer', () => {
 
         it('resolves a superclass located in the same directly selected JAR', async () => {
             const projectPath = createTestProject();
-            const jarPath = path.resolve('lib', 'vineflower-1.11.2.jar');
+            const jarPath = path.resolve('lib', 'vineflower-1.12.0.jar');
             try {
                 const deep = await jarIndexer.getDeepIndex(jarPath, projectPath);
                 const names = new Set(deep.classes.map(clazz => clazz.className));

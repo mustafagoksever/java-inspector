@@ -17,6 +17,9 @@ const __dfDirname = path.dirname(__dfFilename);
 
 const execFileAsync = promisify(execFile);
 
+/** Bump when the way classes are passed to Vineflower changes (v2: nested classes + JAR as library). */
+const DECOMPILE_CACHE_SCHEME = 'v2';
+
 export class DecompilerService {
     private scanner: DependencyScanner;
 
@@ -118,11 +121,14 @@ export class DecompilerService {
     ): Promise<string> {
         const logger = Logger.get(contextPath);
         const fingerprint = await jarIndexer.fingerprint(jarPath);
+        const activeDecompilerPath = await this.resolveDecompilerPath(logger);
         const safeClassName = className.replace(/[^a-zA-Z0-9_$.-]/g, '_');
-        const cachePath = path.join(getResultCacheDir(contextPath), fingerprint.key, 'source', `${safeClassName}.java`);
+        // The decompiler JAR name and the extraction scheme are part of the key, so upgrading Vineflower
+        // (or changing how classes are fed to it) never serves stale output from an older run.
+        const decompilerKey = `${path.basename(activeDecompilerPath, '.jar').replace(/[^a-zA-Z0-9_.-]/g, '_')}-${DECOMPILE_CACHE_SCHEME}`;
+        const cachePath = path.join(getResultCacheDir(contextPath), fingerprint.key, 'source', decompilerKey, `${safeClassName}.java`);
         if (useCache && await fs.pathExists(cachePath)) return readFile(cachePath, 'utf8');
 
-        const activeDecompilerPath = await this.resolveDecompilerPath(logger);
         const workDir = path.join(getClassTempDir(contextPath), `family-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
         try {
             // Vineflower only emits nested/anonymous class bodies when their Outer$*.class files are
@@ -337,7 +343,7 @@ export class DecompilerService {
                 throw new Error('Vineflower decompilation timeout, please check Java environment and decompiler tool');
             }
             if (error instanceof Error && error.message.includes('UnsupportedClassVersionError')) {
-                throw new Error('Vineflower 1.11.2 requires Java 17 or newer. The active Java runtime is too old; update JAVA_HOME or PATH.');
+                throw new Error('Vineflower 1.12.0 requires Java 17 or newer. The active Java runtime is too old; update JAVA_HOME or PATH.');
             }
             throw new Error(`Vineflower decompilation failed: ${error instanceof Error ? error.message : String(error)}`);
         } finally {

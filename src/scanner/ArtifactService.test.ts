@@ -9,7 +9,7 @@ import { projectCache } from '../cache/ProjectCache.js';
 describe('ArtifactService', () => {
     const service = new ArtifactService();
     const libDirectory = path.resolve('lib');
-    const jarPath = path.join(libDirectory, 'vineflower-1.11.2.jar');
+    const jarPath = path.join(libDirectory, 'vineflower-1.12.0.jar');
 
     afterAll(async () => {
         await projectCache.invalidate(libDirectory).catch(() => {});
