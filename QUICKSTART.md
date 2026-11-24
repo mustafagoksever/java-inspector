@@ -83,6 +83,6 @@ Done.
 
 ## Stack
 
-TypeScript 5.7 · MCP · Vineflower 1.11.2 · Node.js 16+ · Maven/mvnd
+TypeScript 5.7 · MCP · Vineflower 1.12.0 · Node.js 20+ · Maven/mvnd
 
 Apache-2.0 · https://github.com/mustafagoksever/java-inspector

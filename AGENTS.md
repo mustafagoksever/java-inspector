@@ -1,7 +1,7 @@
 # Agent Instructions — java-inspector
 
 ## What this is
-TypeScript MCP server that decompiles Java classes from Maven dependencies using Vineflower. Ships as an npm package with a bundled Vineflower JAR.
+TypeScript MCP server that decompiles Java classes from Maven and Gradle dependencies using Vineflower. Ships as an npm package with a bundled Vineflower JAR.
 
 ## Developer commands
 
@@ -10,27 +10,31 @@ TypeScript MCP server that decompiles Java classes from Maven dependencies using
 | Build (compile `src/` → `dist/`) | `npm run build` |
 | Run dev (no build step) | `npm run dev` (uses `tsx`) |
 | Start built server | `npm start` |
-| Test | `npm test` (Jest, currently no test files exist) |
+| Test | `npm test` (Jest + ts-jest, ESM) |
 | Publish prep | `npm run prepublishOnly` (runs `tsc`) |
 
 ## Runtime requirements
-- **Node.js ≥ 16**
+- **Node.js ≥ 20** (required by commander 14 and the MCP SDK)
 - **Java runtime** (for Vineflower decompiler and `javap`)
-- **Maven** (for `dependency:build-classpath` scanning)
+- **Maven** (for `dependency:build-classpath` scanning) or **Gradle** / the project's `gradlew` for Gradle builds
 
 ## Architecture & entry points
 
 | File | Role |
 |------|------|
-| `src/index.ts` | MCP server (`JavaClassAnalyzerMCPServer`). Exposes 5 tools: `scan_dependencies`, `decompile_class`, `analyze_class`, `search_class`, `get_inheritance_tree` |
+| `src/index.ts` | MCP server (`JavaClassAnalyzerMCPServer`, built on `McpServer.registerTool`). Exposes 13 read-only tools: `scan_project`, `find_jar`, `inspect_jar`, `search_class`, `search_code`, `find_implementations`, `find_duplicates`, `inspect_class`, `explain_dependency`, `compare_versions`, `list_dependencies`, `search_resources`, `read_resource`. Response size limits: `SOURCE_AUTO_LIMIT`/`SOURCE_AUTO_PREVIEW`, `BYTECODE_AUTO_LIMIT`, `MAX_RESPONSE_CHARS` (`capResponse`). `SERVER_INSTRUCTIONS` is sent to clients on initialize. |
 | `src/cli.ts` | Commander CLI. Default action (no args) starts the MCP server |
 | `src/cache/ProjectCache.ts` | Cache I/O: JSONL append-only persistence, in-memory `Map` index, pom/classpath hash validation, **cross-process file locking** via `proper-lockfile` |
-| `src/scanner/DependencyScanner.ts` | Runs `mvn dependency:build-classpath`, parses JAR paths. Singleton. Integrates BackgroundScanner + LazyResolver |
+| `src/scanner/DependencyScanner.ts` | Runs `mvn -B dependency:build-classpath` with one output file per reactor module (`cp-${project.groupId}__${project.artifactId}.txt`), merges and de-duplicates JAR paths. Singleton. Integrates BackgroundScanner + LazyResolver |
+| `src/scanner/ArtifactService.ts` | Selector resolution (workspace / jarPath / jarDirectory / prefix / coordinates), class, code and resource search |
+| `src/scanner/ProjectDiscovery.ts` | Breadth-first top-level `pom.xml` discovery (depth ≤ 4, ≤ 5,000 dirs, 30 s cache) |
 | `src/scanner/BackgroundScanner.ts` | Background batch parallel JAR scanning (20 JARs at a time). Writes to JSONL incrementally |
 | `src/scanner/LazyResolver.ts` | On-demand class resolution: O(1) memory lookup, parallel JAR search on cache miss |
-| `src/decompiler/DecompilerService.ts` | Extracts `.class` from JARs (via `yauzl`), runs Vineflower (`java -jar vineflower.jar <class> <outdir>`). Reads generated `.java` from output dir and cleans up temp files |
-| `src/analyzer/JavaClassAnalyzer.ts` | Runs `javap -v -cp <jar> <class>` and parses the text output |
-| `src/utils/methodExtractor.ts` | Extracts a single method body from decompiled source via regex + brace matching. Handles strings, line/block comments, nested braces, and abstract methods. |
+| `src/decompiler/DecompilerService.ts` | Extracts `Outer.class` **and all `Outer$*.class`** from the JAR (via `yauzl`), runs Vineflower (`java -jar vineflower.jar -e=<jar> <classes...> <outdir>`). Reads generated `.java` from output dir and cleans up temp files |
+| `src/analyzer/JavaClassAnalyzer.ts` | Runs `javap` (`-p` signatures for the API view, `-c -l -p -s` for bytecode, `-v` parsing for hierarchy) |
+| `src/utils/methodExtractor.ts` | Extracts a single method body from decompiled source via regex + brace matching. Handles strings, line/block comments, nested braces, and abstract methods. `extractTypeDeclaration` cuts a nested type (`Outer$Inner`) out of the outer class source. |
+| `src/utils/javaOutline.ts` | Brace-aware member outline of Java source (`buildOutline`, `extractMembers`, `memberAtLine`), javap `-c -l` member parsing (`parseJavapMembers`, `javapMemberAtLine`), `cleanDecompilerFailures` |
+| `src/analyzer/ApiDiff.ts` | Public/protected API diff of two sets of class-file metadata (`compare_versions`) |
 | `src/utils/cachePaths.ts` | Cache lives under **`~/.cache/java-inspector/<project>_<hash>/`** |
 
 ## Build & module system
@@ -39,7 +43,7 @@ TypeScript MCP server that decompiles Java classes from Maven dependencies using
 - `tsconfig.json` excludes `**/*.test.ts`
 
 ## Bundled Vineflower JAR — do not break
-- The repo ships `lib/vineflower-1.11.2.jar` (~1.8 MB)
+- The repo ships `lib/vineflower-1.12.0.jar` (~1.6 MB)
 - `.gitignore` has `lib/vineflower-*.jar` **and** `!lib/vineflower-*.jar` to allow tracking the shipped JAR
 - `DecompilerService.findVineflowerJar()` resolution order:
   1. `DECOMPILER_PATH` env var
@@ -55,6 +59,8 @@ TypeScript MCP server that decompiles Java classes from Maven dependencies using
 | `MAVEN_HOME` | Locates `mvn` / `mvn.cmd` |
 | `MAVEN_CMD` | Override Maven executable (e.g., `mvnd`, `mvnw`, full path) |
 | `MAVEN_REPO` | Overrides local Maven repo path (default: `~/.m2/repository`) |
+| `GRADLE_CMD` / `GRADLE_HOME` | Gradle executable (default order: `GRADLE_CMD`, `<project>/gradlew`, `GRADLE_HOME/bin/gradle`, `gradle`) |
+| `JAVA_INSPECTOR_DOWNLOAD_SOURCES` | Default for `inspect_class downloadSources` |
 | `DECOMPILER_PATH` | Override Vineflower JAR location |
 
 ### Maven command resolution order
@@ -67,7 +73,8 @@ TypeScript MCP server that decompiles Java classes from Maven dependencies using
 - JAR class extraction (background scan): 30 s per JAR (`extractClassesFromJarWithTimeout`)
 - Vineflower decompilation: 30 s (`decompileWithVineflower`)
 - `javap` analysis: 10 s (`analyzeClassWithJavap`)
-- Maven `dependency:build-classpath`: 120 s timeout
+- Maven `dependency:build-classpath`: 300 s timeout; `dependency:tree` (explain_dependency): 120 s; `dependency:tree` (list_dependencies / recovery): 300 s; `dependency:get` (downloads): 120 s
+- Gradle classpath init script: 300 s
 - Lazy JAR search (on-demand): 5 s per JAR (`findClassInJar`)
 - `execFile` for Maven uses `shell: true` on Windows.
 
@@ -108,7 +115,7 @@ Cache lives under the **user home** (`~/.cache/java-inspector/...`), not in the 
 |---------|-----------|
 | Module `pom.xml` changes | `pomHash` mismatch in `isIndexComplete()` |
 | Parent POM / dependency management changes | `classpathHash` mismatch in `isIndexComplete()` |
-| Manual force refresh | `scan_dependencies` with `forceRefresh: true` |
+| Manual force refresh | `scan_project` with `forceRefresh: true` |
 
 `isIndexComplete()` checks **both** `pomHash` and `classpathHash`. If either changed, returns `false`, triggering a fresh scan.
 
@@ -134,42 +141,62 @@ Two-tier locking prevents race conditions across multiple MCP server instances:
 
 ## Tool behavior
 
-### `scan_dependencies`
-- **Non-blocking**: Returns immediately with status (`complete` or `in_progress`)
-- On first call: resolves Maven classpath (~5-10 s), starts background scan
-- On subsequent calls: returns current progress or cached complete index
-- `forceRefresh`: invalidates disk + memory cache, force-releases locks, restarts scan
-- **Cross-process safety**: If another process is already scanning the same project, returns `in_progress` with a message instead of starting a duplicate scan
+All tools are registered with `readOnlyHint: true`. Handler errors are returned as `isError: true` results (never as JSON-RPC errors) — keep the `await` in the `register()` wrapper in `src/index.ts`.
+
+Tool descriptions and `SERVER_INSTRUCTIONS` are what make agents choose these tools over shelling out to `javap`/`unzip`. When adding or changing a tool, say in its description which shell command it replaces and describe every parameter.
+
+### `scan_project`
+- **Non-blocking**: returns immediately with `complete` or `in_progress`. Normally not needed because of auto-scan.
+- `forceRefresh`: invalidates disk + memory cache, force-releases locks, restarts scan.
+- **Cross-process safety**: if another process holds `scan.lock`, returns `in_progress`.
 
 ### Auto-scan on startup
-If the MCP server is launched from a directory containing `pom.xml`, it automatically
-starts `scan_dependencies` in the background during server initialization. This is
-non-blocking — the server accepts tool calls immediately. If `pom.xml` is not found
-in `cwd`, the server logs `"No Maven project detected at cwd, skipping auto-scan."` and starts normally, waiting for manual `scan_dependencies` calls.
+After the transport connects, top-level `pom.xml` directories under `cwd` are discovered (bounded BFS) and scanned in the background. Other tools work immediately on the partial index and report `complete: false`.
 
-### `decompile_class`
-- `ensureScanStarted()` checks if index exists. If not, starts background scan (non-blocking).
-- `findJarForClass()` first checks in-memory `Map` (O(1)). If miss, searches JARs on-demand in parallel batches.
-- Temp `.class` file is **always cleaned up** after decompilation (regardless of `useCache`).
-- Vineflower writes output to a temporary directory; the generated `.java` file is read and the temp directory is cleaned up automatically.
-- **Method extraction**: pass `methodName` to extract a single method body instead of the full class. Uses `methodExtractor.ts` (regex + brace matching).
-- **Pagination**: pass `offset` (1-based) and `limit` to return a slice of lines. `limit=0` means all lines. Ignored when `methodName` is provided.
+### `inspect_class`
+- For Maven dependencies only `className` is needed; the JAR comes from the project classpath. On a cold start (classpath not resolved yet) the lookup waits up to 90 s for Maven (`DependencyScanner.waitForClasspath`, progress notifications sent) instead of failing; `search_class` waits up to 30 s in `balanced` mode. While the background index is incomplete, JARs whose Maven path matches the package (`ArtifactService.packageRelevance`) are opened first.
+- Requires an **exact** class name match (FQN, or simple name if unique). Never falls back to fuzzy matches; on a miss it errors with similar class suggestions.
+- `view=source`: embedded `.java` → `*-sources.jar` → Vineflower. Response states the source origin. `methodName`/`paramTypes` extract one method; `offset`/`limit` page lines and the response reports `Lines: x-y of N`.
+- Nested classes: `Outer$Inner` (binary name) or `Outer.Inner` (source-style, retried as `Outer$Inner`). Resolution goes through the outer class (`ArtifactService.searchNestedClasses`), because the index skips inner classes. `view=source` loads the outer source and returns only the nested declaration (`Enclosing class:` in the response); anonymous classes (`Outer$1`) fall back to the full outer source with a note. api/bytecode/hierarchy run on the nested `.class` itself.
+- `view=outline`: members with line ranges. Sources over `SOURCE_AUTO_LIMIT` lines without offset/limit return the first lines plus this outline.
+- `line`: stack-trace line → containing member (real sources: numbered lines with `>>`; decompiled: located through the javap `LineNumberTable`, lambdas map to their enclosing method).
+- `methodName` not declared in the class → BFS over superclasses/interfaces (`inheritedMemberSource`, ≤ 25 classes).
+- `downloadSources` (Maven): `mvn dependency:get ...:jar:sources` once per GAV, then the sources JAR is used.
+- Vineflower failures (`$VF: Couldn't be decompiled`) are cleaned by `cleanDecompilerFailures`; failed methods are listed in `sourceNote`.
+- `view=api`: `javap -p` output (in `json` format too; the separate fields/methods arrays were dropped because they duplicated it).
+- `view=hierarchy`: superclass chain with interfaces per level.
+- `view=bytecode`: `javap -c -l -p -s`; with `methodName`/`line` only that member; over `BYTECODE_AUTO_LIMIT` lines only member signatures.
 
-### `analyze_class`
-- `ensureScanStarted()` checks if index exists. If not, starts background scan (non-blocking).
-- `findJarForClass()` first checks in-memory `Map` (O(1)). If miss, searches JARs on-demand in parallel batches.
+### `search_class` / `search_code` / `find_implementations` / `search_resources`
+- Use the live in-memory index first, then open unindexed JARs on demand within a per-call budget; `complete: false` + `remainingJarCount` tell the agent to call again or narrow with `jarNamePrefix`/`jarPath`.
+- `search_code` / `find_implementations` order JARs with `orderForDeepSearch`: already deep-indexed JARs first (free), then by `packageRelevance` of the target class / reference owner, so the new-JAR budget goes to the likeliest artifacts.
 
-### `search_class`
-- Iterates the live in-memory Map. Returns partial results if background scan is still running.
-- Adds a note about scan completion percentage when incomplete.
+### `compare_versions`
+- Inputs: `coordinates` + `toVersion` (`fromVersion` defaults to the classpath JAR of that artifact), or `fromJarPath` + `toJarPath`; `className` / `packagePrefix` narrow it; `download` runs `mvn dependency:get`.
+- Diff is computed from the deep indexes (`ClassFileMetadataReader`) by `diffApi`: public/protected, non-synthetic, non-bridge members keyed by name+descriptor. Breaking: removed class/member, narrowed visibility, static/final/abstract changes, superclass change, removed interface, new abstract method. Removed `toString/hashCode/equals` overrides are not breaking.
+
+### `list_dependencies`
+- `mvn dependency:tree -DoutputFile=tree-${project.groupId}__${project.artifactId}.txt` (one file per module), parsed by `parseDependencyTree` (depth from the tree prefix, `via` = parent). Cached in `dependency-tree.json` keyed by pom hash + classpath hash. Maven only.
+
+### Gradle
+- `buildToolOf()` (ProjectDiscovery): `pom.xml` → maven (preferred), else `settings.gradle[.kts]`/`build.gradle[.kts]` → gradle. Discovery returns both kinds of roots.
+- `getGradleClasspath`: writes `GRADLE_INIT_SCRIPT` (task `javaInspectorClasspath` on every project, lenient `artifactView` of compile/runtime/test classpaths) and runs it with `--no-configuration-cache`.
+- `getPomHash` hashes root Gradle build files + `gradle/libs.versions.toml` when there is no pom.
+- Gradle cache JARs (`files-2.1/<g>/<a>/<v>/<sha1>/`) are understood by `coordinatesFromJarPath` and `findSourcesJar`.
+
+### Multi-module recovery
+- If `dependency:build-classpath` fails with an unresolved (unbuilt sibling) module, `recoverReactorClasspath` reruns it with `-fae` and adds external dependencies from `dependency:tree` that exist in the local repo; reactor modules are skipped.
+
+### `find_duplicates`
+- Classes present in more than one classpath JAR, grouped by the JAR set that shares them, with coordinates parsed from the `~/.m2` layout. `kind` is `same-artifact-multiple-versions` or `different-artifacts` (split package / shaded copy); same-artifact groups sort first.
+- Uses the background class index (`getAllEntriesWithDuplicates`) and light-scans JARs not processed yet (fast: 50 JARs / 5 s, balanced: 500 JARs / 25 s). Inner classes are ignored (they follow their outer class).
 
 ## Gotchas
-- No Jest config file exists; `npm test` relies on Jest defaults.
-- Test files: `src/utils/CrossProcessLock.test.ts` covers cross-process lock behavior.
-- The scanner uses `mvn dependency:build-classpath`, not `dependency:tree`. No regex parsing.
+- Jest config is `jest.config.js` (ts-jest ESM). Every module has a `*.test.ts` next to it.
+- The scanner uses `mvn dependency:build-classpath`, not `dependency:tree` (the tree is only used by `list_dependencies` and multi-module recovery).
 - `yauzl` is used for ZIP/JAR reading (streams, lazy entries). Be careful with resource leaks; the code already ignores close errors in catch blocks.
-- Inner classes (`$` in filename) are intentionally skipped during index building.
-- Gradle is **not** supported; only Maven.
+- Inner classes (`$` in filename) are intentionally skipped during index building; `Outer$Inner` lookups resolve the outer class and then read the JAR's light index.
+- Gradle is supported for classpath resolution; Maven-only tools (`list_dependencies`, `explain_dependency`, `downloadSources`) return a clear error for Gradle builds.
 - Brute-force fallback (`~/.m2/repository` recursive scan) has been **removed**. If Maven fails, the tool returns an error.
 - Cross-process locking (`proper-lockfile`) uses `mkdir` strategy which works on all platforms including network filesystems.
 - If a process is killed with SIGKILL while holding `scan.lock`, the lock becomes stale after 60s and another process can acquire it.
@@ -201,6 +228,7 @@ Each project gets per-process append-only log files under the cache directory:
 | `[SERVER]` | Server startup/shutdown |
 | `[AUTO-SCAN]` | Automatic scan on startup |
 | `[MAVEN]` | Maven command resolution & classpath building |
+| `[GRADLE]` | Gradle classpath resolution |
 | `[SCAN]` | Background JAR scanning |
 | `[JAVAP]` | `javap` class analysis |
 | `[DECOMPILE]` | Vineflower decompilation |

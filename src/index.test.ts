@@ -58,13 +58,147 @@ describe('JavaClassAnalyzerMCPServer', () => {
                 'search_class',
                 'search_code',
                 'find_implementations',
+                'find_duplicates',
                 'inspect_class',
                 'explain_dependency',
+                'compare_versions',
+                'list_dependencies',
                 'search_resources',
                 'read_resource',
             ]);
             const inspectClass = result.tools.find((tool: any) => tool.name === 'inspect_class');
             expect(inspectClass.inputSchema.properties).not.toHaveProperty('decompilerPath');
+            for (const tool of result.tools) {
+                expect(tool.annotations).toEqual(expect.objectContaining({ readOnlyHint: true, destructiveHint: false }));
+                expect(tool.description.length).toBeGreaterThan(80);
+            }
+            expect(inspectClass.description).toMatch(/javap/);
+        });
+
+        it('advertises usage instructions so agents prefer the tools over shell javap', () => {
+            expect((server as any).mcp.server._instructions).toMatch(/Instead of `javap`/);
+        });
+    });
+
+    describe('tool call error handling', () => {
+        const callTool = async (name: string, args: Record<string, unknown>) => {
+            const handler = (server as any).server._requestHandlers.get('tools/call');
+            return handler({ method: 'tools/call', params: { name, arguments: args } }, { signal: new AbortController().signal, sendNotification: async () => {}, sendRequest: async () => ({}) });
+        };
+
+        it('returns handler failures as isError results instead of protocol errors', async () => {
+            const result = await callTool('inspect_class', { className: 'a.B', jarPath: path.join(os.tmpdir(), 'does-not-exist.jar') });
+            expect(result.isError).toBe(true);
+            expect(result.content[0].text).toMatch(/Tool call failed/);
+        });
+
+        it('does not silently resolve a misspelled class to a fuzzy match', async () => {
+            const jarPath = path.resolve('lib', 'vineflower-1.12.0.jar');
+            const result = await callTool('inspect_class', { className: 'org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompile', jarPath, view: 'hierarchy' });
+            expect(result.isError).toBe(true);
+            expect(result.content[0].text).toMatch(/Class not found/);
+            expect(result.content[0].text).toMatch(/ConsoleDecompiler/);
+        });
+        it('inspects nested classes by binary or source-style name', async () => {
+            const jarPath = path.resolve('lib', 'vineflower-1.12.0.jar');
+            const binary = await callTool('inspect_class', { className: 'org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler$SaveType', jarPath, view: 'all' });
+            expect(binary.isError).toBeFalsy();
+            const text = binary.content[0].text;
+            expect(text).toMatch(/Enclosing class: org\.jetbrains\.java\.decompiler\.main\.decompiler\.ConsoleDecompiler/);
+            expect(text).toMatch(/enum SaveType/);
+            expect(text).not.toMatch(/class ConsoleDecompiler/);
+            expect(text).toMatch(/API \(javap -p\)/);
+            const dotted = await callTool('inspect_class', { className: 'org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler.SaveType', jarPath, view: 'api' });
+            expect(dotted.isError).toBeFalsy();
+            expect(dotted.content[0].text).toMatch(/ConsoleDecompiler\$SaveType/);
+        }, 60_000);
+    });
+
+    describe('context-efficient class views', () => {
+        const callTool = async (name: string, args: Record<string, unknown>) => {
+            const handler = (server as any).server._requestHandlers.get('tools/call');
+            return handler({ method: 'tools/call', params: { name, arguments: args } }, { signal: new AbortController().signal, sendNotification: async () => {}, sendRequest: async () => ({}) });
+        };
+        const jarPath = path.resolve('lib', 'vineflower-1.12.0.jar');
+        const consoleDecompiler = 'org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler';
+
+        it('returns an outline with line ranges', async () => {
+            const result = await callTool('inspect_class', { className: consoleDecompiler, jarPath, view: 'outline' });
+            expect(result.isError).toBeFalsy();
+            expect(result.content[0].text).toMatch(/Outline/);
+            expect(result.content[0].text).toMatch(/L\d+-\d+ +public static void main\(String\[\] args\)/);
+        }, 60_000);
+
+        it('finds the method containing a stack-trace line via the class line table', async () => {
+            const result = await callTool('inspect_class', { className: consoleDecompiler, jarPath, line: 286 });
+            expect(result.isError).toBeFalsy();
+            expect(result.content[0].text).toMatch(/Original line 286 is in public void saveFolder\(java\.lang\.String\)/);
+            expect(result.content[0].text).toMatch(/public void saveFolder\(String path\)/);
+        }, 60_000);
+
+        it('returns one method of bytecode and lists members instead of dumping large bytecode', async () => {
+            const one = await callTool('inspect_class', { className: consoleDecompiler, jarPath, view: 'bytecode', methodName: 'saveFolder' });
+            expect(one.content[0].text).toMatch(/public void saveFolder\(java\.lang\.String\);/);
+            expect(one.content[0].text).not.toMatch(/public static void main/);
+            const all = await callTool('inspect_class', { className: consoleDecompiler, jarPath, view: 'bytecode' });
+            expect(all.content[0].text).toMatch(/only member signatures are listed/);
+            expect(all.content[0].text.length).toBeLessThan(20_000);
+        }, 60_000);
+
+        it('looks up inherited methods in superclasses and interfaces', async () => {
+            const result = await callTool('inspect_class', { className: 'org.jetbrains.java.decompiler.main.decompiler.DirectoryResultSaver', jarPath, methodName: 'getCodeLineData' });
+            expect(result.isError).toBeFalsy();
+            expect(result.content[0].text).toMatch(/Declared in: org\.jetbrains\.java\.decompiler\.main\.extern\.IResultSaver/);
+            expect(result.content[0].text).toMatch(/default byte\[\] getCodeLineData/);
+        }, 60_000);
+
+        it('groups search results under their JAR', async () => {
+            const result = await callTool('search_class', { query: 'ResultSaver', jarPath });
+            const text = result.content[0].text;
+            expect(text.split(jarPath).length - 1).toBe(1);
+            expect(text).toMatch(/\n  - org\.jetbrains\.java\.decompiler\.main\.decompiler\.DirectoryResultSaver/);
+        }, 60_000);
+    });
+
+    describe('sliceSource', () => {
+        const source = ['a', 'b', 'c', 'd', 'e'].join('\n');
+
+        it('returns the full source without a range by default', () => {
+            expect((server as any).sliceSource(source, {})).toEqual({ source });
+        });
+
+        it('returns the first lines plus an outline for large files instead of everything', () => {
+            const big = ['public class Big {', ...Array.from({ length: 500 }, (_, index) => `    public int m${index}() { return ${index}; }`), '}'].join('\n');
+            const slice = (server as any).sliceSource(big, {});
+            expect(slice.source.split('\n')).toHaveLength(120);
+            expect(slice.sourceRange).toEqual({ startLine: 1, endLine: 120, totalLines: 502 });
+            expect(slice.outline).toMatch(/L401 +public int m399\(\)/);
+            expect((server as any).sliceSource(big, { limit: 600 }).source).toBe(big);
+        });
+
+        it('shrinks oversized json results into valid json instead of cutting the text', async () => {
+            const structured = { items: Array.from({ length: 3000 }, (_, index) => ({ name: `item-${index}`, value: 'v'.repeat(20) })), source: 'x'.repeat(30_000) };
+            const response = (server as any).formatResponse('text', structured, 'json');
+            const text = response.content[0].text;
+            expect(text.length).toBeLessThanOrEqual(40_000);
+            const parsed = JSON.parse(text);
+            expect(parsed.truncated).toMatchObject({ maxChars: 40_000 });
+            expect(parsed.items.length).toBeGreaterThan(0);
+            expect(parsed.items.length).toBeLessThan(3000);
+        });
+
+        it('caps oversized responses with a hint', () => {
+            const capped = (server as any).capResponse('x'.repeat(10) + '\n' + 'y'.repeat(50_000));
+            expect(capped.length).toBeLessThan(41_000);
+            expect(capped).toMatch(/Response truncated/);
+        });
+
+        it('reports the returned range and total lines when paging', () => {
+            expect((server as any).sliceSource(source, { offset: 2, limit: 2 })).toEqual({ source: 'b\nc', sourceRange: { startLine: 2, endLine: 3, totalLines: 5 } });
+        });
+
+        it('rejects an offset past the end instead of returning nothing', () => {
+            expect(() => (server as any).sliceSource(source, { offset: 99 })).toThrow(/past the end/);
         });
     });
 
@@ -76,7 +210,7 @@ describe('JavaClassAnalyzerMCPServer', () => {
 
         it('uses collision-safe paths for equal simple class names in one JAR', async () => {
             const projectPath = createTestProject();
-            const jarPath = path.resolve('lib', 'vineflower-1.11.2.jar');
+            const jarPath = path.resolve('lib', 'vineflower-1.12.0.jar');
             try {
                 const first = await (server as any).getInspectionClassFile({
                     className: 'com.first.User', jarPath, packageName: 'com.first', simpleName: 'User', score: 1, origin: 'direct', contextPath: projectPath,
@@ -94,7 +228,7 @@ describe('JavaClassAnalyzerMCPServer', () => {
 
         it('resolves a superclass located in the same directly selected JAR', async () => {
             const projectPath = createTestProject();
-            const jarPath = path.resolve('lib', 'vineflower-1.11.2.jar');
+            const jarPath = path.resolve('lib', 'vineflower-1.12.0.jar');
             try {
                 const deep = await jarIndexer.getDeepIndex(jarPath, projectPath);
                 const names = new Set(deep.classes.map(clazz => clazz.className));
@@ -116,63 +250,6 @@ describe('JavaClassAnalyzerMCPServer', () => {
             } finally {
                 await cleanupTestProject(projectPath);
             }
-        });
-    });
-
-    describe('applyFilter', () => {
-        const analysis = {
-            fields: [
-                { name: 'publicField', modifiers: ['public'] },
-                { name: 'privateField', modifiers: ['private'] },
-                { name: 'protectedField', modifiers: ['protected'] },
-            ],
-            methods: [
-                { name: 'publicMethod', modifiers: ['public'] },
-                { name: 'privateMethod', modifiers: ['private'] },
-                { name: 'protectedMethod', modifiers: ['protected'] },
-            ],
-        };
-
-        it('should return everything for filter=all', () => {
-            const result = (server as any).applyFilter(analysis, 'all');
-            expect(result.fields).toHaveLength(3);
-            expect(result.methods).toHaveLength(3);
-        });
-
-        it('should return only fields for filter=fields', () => {
-            const result = (server as any).applyFilter(analysis, 'fields');
-            expect(result.fields).toHaveLength(3);
-            expect(result.methods).toHaveLength(0);
-        });
-
-        it('should return only methods for filter=methods', () => {
-            const result = (server as any).applyFilter(analysis, 'methods');
-            expect(result.fields).toHaveLength(0);
-            expect(result.methods).toHaveLength(3);
-        });
-
-        it('should filter by public modifier', () => {
-            const result = (server as any).applyFilter(analysis, 'public');
-            expect(result.fields).toHaveLength(1);
-            expect(result.methods).toHaveLength(1);
-            expect(result.fields[0].name).toBe('publicField');
-            expect(result.methods[0].name).toBe('publicMethod');
-        });
-
-        it('should filter by private modifier', () => {
-            const result = (server as any).applyFilter(analysis, 'private');
-            expect(result.fields).toHaveLength(1);
-            expect(result.methods).toHaveLength(1);
-            expect(result.fields[0].name).toBe('privateField');
-            expect(result.methods[0].name).toBe('privateMethod');
-        });
-
-        it('should filter by protected modifier', () => {
-            const result = (server as any).applyFilter(analysis, 'protected');
-            expect(result.fields).toHaveLength(1);
-            expect(result.methods).toHaveLength(1);
-            expect(result.fields[0].name).toBe('protectedField');
-            expect(result.methods[0].name).toBe('protectedMethod');
         });
     });
 
@@ -204,144 +281,4 @@ describe('JavaClassAnalyzerMCPServer', () => {
         });
     });
 
-    describe('validateProjectPath', () => {
-        let projectPath: string;
-
-        beforeEach(() => {
-            projectPath = createTestProject();
-        });
-
-        afterEach(async () => {
-            await cleanupTestProject(projectPath);
-        });
-
-        it('should throw when projectPath is missing', async () => {
-            await expect((server as any).validateProjectPath('')).rejects.toThrow('projectPath is required');
-            await expect((server as any).validateProjectPath(undefined)).rejects.toThrow('projectPath is required');
-        });
-
-        it('should throw when projectPath is not absolute', async () => {
-            await expect((server as any).validateProjectPath('relative/path')).rejects.toThrow('must be an absolute path');
-        });
-
-        it('should throw when projectPath does not exist', async () => {
-            const nonExistent = path.join(os.tmpdir(), `non-existent-${Date.now()}`);
-            await expect((server as any).validateProjectPath(nonExistent)).rejects.toThrow('does not exist');
-        });
-
-        it('should throw when projectPath is not a directory', async () => {
-            const filePath = path.join(projectPath, 'file.txt');
-            fs.writeFileSync(filePath, 'test');
-            await expect((server as any).validateProjectPath(filePath)).rejects.toThrow('not a directory');
-        });
-
-        it('should throw when pom.xml is missing', async () => {
-            const noPomDir = path.join(os.tmpdir(), `no-pom-${process.pid}-${Date.now()}`);
-            fs.mkdirSync(noPomDir, { recursive: true });
-            await expect((server as any).validateProjectPath(noPomDir)).rejects.toThrow('No pom.xml found');
-            fs.rmSync(noPomDir, { recursive: true, force: true });
-        });
-
-        it('should not throw for valid Maven project', async () => {
-            await expect((server as any).validateProjectPath(projectPath)).resolves.toBeUndefined();
-        });
-    });
-
-    describe('getDebugEnv', () => {
-        it('should return relevant environment variables', () => {
-            const env = (server as any).getDebugEnv();
-            expect(env).toHaveProperty('NODE_ENV');
-            expect(env).toHaveProperty('JAVA_HOME');
-            expect(env).toHaveProperty('MAVEN_HOME');
-            expect(env).toHaveProperty('MAVEN_CMD');
-            expect(env).toHaveProperty('MAVEN_REPO');
-            expect(env).toHaveProperty('DECOMPILER_PATH');
-        });
-    });
-
-    describe('logToolDebug', () => {
-        it('should not log in production mode', () => {
-            process.env.NODE_ENV = 'production';
-            const projectPath = createTestProject();
-            const logger = Logger.get(projectPath);
-            const spy = jest.spyOn(logger, 'debug').mockImplementation(() => {});
-            (server as any).logToolDebug(logger, 'test_tool', '/tmp/project', { extra: true });
-            expect(spy).not.toHaveBeenCalled();
-            spy.mockRestore();
-            Logger.clearLog(projectPath);
-        });
-
-        it('should log in development mode', () => {
-            process.env.NODE_ENV = 'development';
-            const projectPath = createTestProject();
-            const logger = Logger.get(projectPath);
-            const spy = jest.spyOn(logger, 'debug').mockImplementation(() => {});
-            (server as any).logToolDebug(logger, 'test_tool', '/tmp/project', { extra: true });
-            expect(spy).toHaveBeenCalled();
-            spy.mockRestore();
-            Logger.clearLog(projectPath);
-        });
-    });
-
-    describe('ensureScanStarted', () => {
-        let projectPath: string;
-
-        beforeEach(() => {
-            projectPath = createTestProject();
-        });
-
-        afterEach(async () => {
-            await cleanupTestProject(projectPath);
-        });
-
-        it('should return immediately when index is complete', async () => {
-            const mockScanner = {
-                isIndexComplete: jest.fn<any>().mockResolvedValue(true),
-                getClasspath: jest.fn<any>(),
-                scanProject: jest.fn<any>(),
-            };
-            (server as any).scanner = mockScanner;
-
-            await (server as any).ensureScanStarted(projectPath);
-            expect(mockScanner.isIndexComplete).toHaveBeenCalledWith(projectPath);
-            expect(mockScanner.getClasspath).not.toHaveBeenCalled();
-            expect(mockScanner.scanProject).not.toHaveBeenCalled();
-        });
-
-        it('should return when classpath exists but index is incomplete', async () => {
-            const mockScanner = {
-                isIndexComplete: jest.fn<any>().mockResolvedValue(false),
-                getClasspath: jest.fn<any>().mockResolvedValue(['some.jar']),
-                scanProject: jest.fn<any>(),
-            };
-            (server as any).scanner = mockScanner;
-
-            await (server as any).ensureScanStarted(projectPath);
-            expect(mockScanner.getClasspath).toHaveBeenCalledWith(projectPath);
-            expect(mockScanner.scanProject).not.toHaveBeenCalled();
-        });
-
-        it('should start scan when no index or classpath exists', async () => {
-            const mockScanner = {
-                isIndexComplete: jest.fn<any>().mockResolvedValue(false),
-                getClasspath: jest.fn<any>().mockResolvedValue(null),
-                scanProject: jest.fn<any>().mockResolvedValue(undefined),
-            };
-            (server as any).scanner = mockScanner;
-
-            await (server as any).ensureScanStarted(projectPath);
-            expect(mockScanner.scanProject).toHaveBeenCalledWith(projectPath, false, undefined);
-        });
-
-        it('should propagate scan errors', async () => {
-            const mockScanner = {
-                isIndexComplete: jest.fn<any>().mockResolvedValue(false),
-                getClasspath: jest.fn<any>().mockResolvedValue(null),
-                scanProject: jest.fn<any>().mockRejectedValue(new Error('scan failed')),
-            };
-            (server as any).scanner = mockScanner;
-
-            await expect((server as any).ensureScanStarted(projectPath)).rejects.toThrow('Unable to start dependency scan');
-        });
-    });
 });

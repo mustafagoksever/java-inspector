@@ -4,7 +4,7 @@ import { JarIndexer } from './JarIndexer.js';
 
 describe('ClassFileMetadataReader', () => {
     const indexer = new JarIndexer();
-    const vineflower = path.resolve('lib', 'vineflower-1.11.2.jar');
+    const vineflower = path.resolve('lib', 'vineflower-1.12.0.jar');
 
     it('reads hierarchy, members, references, and real string constants', async () => {
         const entry = 'org/jetbrains/java/decompiler/main/decompiler/ConsoleDecompiler.class';

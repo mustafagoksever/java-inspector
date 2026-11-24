@@ -361,3 +361,46 @@ export function matchParamTypes(sigParams: string[], filterTypes: string[]): boo
     }
     return true;
 }
+/**
+ * Extract a nested type declaration (class/interface/enum/record/@interface) from Java source.
+ * `names` is the nesting path below the top-level class, e.g. ["Builder"] for Outer$Builder or
+ * ["Node", "Entry"] for Outer$Node$Entry. Leading annotation lines are kept. Returns null when a
+ * level cannot be found (e.g. anonymous classes such as Outer$1).
+ */
+export function extractTypeDeclaration(sourceCode: string, names: string[]): string | null {
+    let lines = sourceCode.split('\n');
+    let block: string | null = null;
+    for (const name of names) {
+        if (!/^[A-Za-z_$][\w$]*$/.test(name)) return null;
+        const declaration = new RegExp(`(^|[\\s(])(class|interface|enum|record)\\s+${escapeRegex(name)}\\b`);
+        // Direct members are the least indented match (a deeper Foo$Builder must not win over Builder).
+        let start = -1;
+        let bestIndent = Infinity;
+        lines.forEach((line, index) => {
+            if (index === 0 && block !== null) return; // the enclosing declaration itself
+            if (/^\s*(\*|\/\*)/.test(line) || !declaration.test(stripLineComment(line))) return;
+            const indent = line.match(/^[ \t]*/)![0].length;
+            if (indent < bestIndent) { bestIndent = indent; start = index; }
+        });
+        if (start < 0) return null;
+        const body = extractSingleMethodBody(lines, start);
+        if (body === null) return null;
+        let first = start;
+        while (first > 0 && /^\s*@/.test(lines[first - 1])) first--;
+        block = [...lines.slice(first, start), body].join('\n');
+        lines = block.split('\n');
+    }
+    return block === null ? null : dedent(block);
+}
+
+function stripLineComment(line: string): string {
+    const index = line.indexOf('//');
+    return index >= 0 ? line.substring(0, index) : line;
+}
+
+function dedent(text: string): string {
+    const lines = text.split('\n');
+    const indents = lines.filter(line => line.trim()).map(line => line.match(/^[ \t]*/)![0].length);
+    const min = indents.length ? Math.min(...indents) : 0;
+    return min > 0 ? lines.map(line => line.substring(Math.min(min, line.match(/^[ \t]*/)![0].length))).join('\n') : text;
+}

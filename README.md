@@ -1,16 +1,16 @@
 # Java Inspector
 
-Java Inspector is an MCP server that gives AI agents fast, read-only access to code and metadata inside Maven dependencies, local JARs, executable JARs, WARs, and the JDK.
+Java Inspector is an MCP server that gives AI agents fast, read-only access to code and metadata inside Maven and Gradle dependencies, local JARs, executable JARs, WARs, and the JDK.
 
-The server starts accepting MCP calls immediately. Maven dependency scanning continues in the background, while an interactive query can promote the JAR it needs to a foreground queue and return without waiting for the complete project index.
+The server starts accepting MCP calls immediately. Dependency scanning continues in the background, while an interactive query can promote the JAR it needs to a foreground queue and return without waiting for the complete project index.
 
 ## Requirements
 
-- Node.js 16 or newer
-- Java 17 or newer (`java` and `javap`); required by bundled Vineflower 1.11.2
-- Maven for Maven project discovery and dependency resolution
+- Node.js 20 or newer
+- Java 17 or newer (`java` and `javap`); required by bundled Vineflower 1.12.0
+- Maven for Maven projects; Gradle (or the project's `gradlew`) for Gradle projects
 
-Vineflower 1.11.2 is bundled in `lib/`.
+Vineflower 1.12.0 is bundled in `lib/`.
 
 ## Install and configure
 
@@ -41,11 +41,13 @@ node dist/cli.js start
 
 After the MCP transport connects, Java Inspector performs non-blocking discovery:
 
-1. If `cwd/pom.xml` exists, that Maven project is used.
+1. If `cwd` has a `pom.xml` (or a Gradle `settings.gradle[.kts]` / `build.gradle[.kts]`), that build is used. Maven wins when both exist.
 2. Otherwise directories are searched breadth-first.
-3. Every `pom.xml` at the first matching depth is selected.
-4. Deeper POMs are not independently scanned.
-5. Maven classpaths are resolved and their JARs enter the background light-scan queue.
+3. Every build root at the first matching depth is selected.
+4. Deeper builds are not independently scanned.
+5. Classpaths are resolved (`mvn dependency:build-classpath`, or a Gradle init script that prints the compile/runtime/test classpath of every project) and their JARs enter the background light-scan queue.
+
+In a multi-module Maven checkout whose modules depend on each other but were never installed, Maven 3 fails `dependency:build-classpath`. Java Inspector then retries with `--fail-at-end` and adds the external dependencies of `dependency:tree` that are in the local repository.
 
 Directories such as `.git`, `node_modules`, `.gradle`, `target`, `build`, and `out` are excluded from POM discovery.
 
@@ -55,14 +57,17 @@ Local, non-Maven JARs are not scanned at startup. They are found and indexed onl
 
 | Tool | Purpose |
 |---|---|
-| `scan_project` | Start, refresh, or poll the non-blocking Maven scan. |
+| `scan_project` | Start, refresh, or poll the non-blocking dependency scan. |
 | `find_jar` | Find an artifact by path, filename, prefix, substring, or Maven coordinates without opening it. |
 | `inspect_jar` | Inspect manifest, Maven metadata, packages, classes, resources, and nested artifacts. |
 | `search_class` | Search the live partial index and foreground-scan relevant JARs on a miss. |
 | `search_code` | Search methods, fields, annotations, references, or string constants without mass decompilation. |
 | `find_implementations` | Find direct or transitive implementations/subtypes from lazy deep indexes. |
-| `inspect_class` | Return source, API, hierarchy, bytecode, or all views for a class. |
+| `find_duplicates` | List classes present in more than one classpath JAR (two versions of one artifact, split packages, shaded copies). |
+| `inspect_class` | Return source, outline, API, hierarchy, bytecode, or all views for a class. One method with `methodName`, or the method at a stack-trace `line`. Nested classes: `Outer$Inner`. |
 | `explain_dependency` | Run a filtered Maven dependency tree for a selected artifact. |
+| `compare_versions` | Public/protected API diff between two versions of an artifact (or two JARs) with breaking changes flagged. |
+| `list_dependencies` | Resolved dependencies per Maven module: GAV, scope, direct or transitive (with the path). |
 | `search_resources` | Search resource paths or bounded text content. |
 | `read_resource` | Read an exact text resource with line pagination. |
 
@@ -143,13 +148,16 @@ Context-wide deep searches are intentionally bounded. A partial response include
 
 `inspect_class` supports:
 
-- `source`: local `*-sources.jar`, embedded `.java`, or Vineflower decompilation.
-- `api`: fields, methods, constructors, modifiers, superclass, and interfaces via `javap`.
-- `hierarchy`: resolved superclass chain.
-- `bytecode`: `javap -c -l -p -s` output.
+- `source`: local `*-sources.jar`, embedded `.java`, or Vineflower decompilation. With `downloadSources: true` (Maven), a missing `-sources.jar` is fetched with `mvn dependency:get` first.
+- `outline`: every member with its line range; the cheapest view of a large class.
+- `api`: `javap -p` signatures.
+- `hierarchy`: resolved superclass chain with interfaces.
+- `bytecode`: `javap -c -l -p -s` output; with `methodName` or `line` only that member.
 - `all`: all available views.
 
-Source responses support `methodName`, `paramTypes`, `offset`, and `limit`.
+Source responses support `methodName` (searched in superclasses and interfaces when the class does not declare it), `paramTypes`, `line` (stack-trace line number: returns the containing method, also for decompiled code via the line table), `offset`, and `limit`.
+
+Responses are kept small for agent contexts: sources over 400 lines return the first 120 lines plus an outline, bytecode over 400 lines returns member signatures, and every response is capped at 40,000 characters with a note saying how to narrow the request. Methods that Vineflower cannot decompile keep its bytecode listing without the decompiler's stack trace, and the response names them.
 
 The decompiler executable cannot be overridden by a tool argument. Java Inspector uses the bundled Vineflower JAR or the operator-controlled `DECOMPILER_PATH` environment variable.
 
@@ -197,6 +205,9 @@ Per-JAR caches use resolved path, size, and modification time as their fingerpri
 | `MAVEN_HOME` | Locates Maven. |
 | `MAVEN_CMD` | Overrides the Maven executable. |
 | `MAVEN_REPO` | Overrides the local Maven repository path. |
+| `GRADLE_CMD` | Overrides the Gradle executable (default: the project's `gradlew`, then `GRADLE_HOME/bin/gradle`, then `gradle`). |
+| `GRADLE_HOME` | Locates Gradle. |
+| `JAVA_INSPECTOR_DOWNLOAD_SOURCES` | `true` makes `inspect_class` download missing `-sources.jar` files by default. |
 | `DECOMPILER_PATH` | Overrides the bundled Vineflower JAR. |
 
 Maven command resolution order is `MAVEN_CMD`, `mvnd`, `MAVEN_HOME/bin/mvn`, then `mvn` from `PATH`.

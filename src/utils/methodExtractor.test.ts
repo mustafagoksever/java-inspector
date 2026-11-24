@@ -1,4 +1,4 @@
-import { extractMethod, extractMethodMap, MethodLineRange } from './methodExtractor.js';
+import { extractMethod, extractMethodMap, extractTypeDeclaration, MethodLineRange } from './methodExtractor.js';
 
 describe('extractMethod', () => {
     it('should extract a simple method with body', () => {
@@ -312,5 +312,49 @@ describe('extractMethodMap', () => {
         const methods = extractMethodMap(source);
         expect(methods.length).toBe(1);
         expect(methods[0].signature).toBe('public static synchronized String getName(int id, String prefix) {');
+    });
+});
+
+describe('extractTypeDeclaration', () => {
+    const source = [
+        'package demo;',
+        '',
+        'public class Outer {',
+        '    private final Builder builder = new Builder();',
+        '',
+        '    public static class Node {',
+        '        // class Builder in a comment must not match',
+        '        static final class Builder {',
+        '            int deep;',
+        '        }',
+        '',
+        '        public record Entry(String key) {',
+        '            String brace() { return "}"; }',
+        '        }',
+        '    }',
+        '',
+        '    @Deprecated',
+        '    public static class Builder {',
+        '        public Builder name(String name) { return this; }',
+        '    }',
+        '',
+        '    public enum Mode { A, B }',
+        '}',
+    ].join('\n');
+
+    it('returns the directly nested declaration, not a deeper one with the same name', () => {
+        const builder = extractTypeDeclaration(source, ['Builder']);
+        expect(builder).toBe('@Deprecated\npublic static class Builder {\n    public Builder name(String name) { return this; }\n}');
+    });
+
+    it('walks multiple nesting levels and ignores braces inside strings', () => {
+        expect(extractTypeDeclaration(source, ['Node', 'Entry'])).toBe('public record Entry(String key) {\n    String brace() { return "}"; }\n}');
+        expect(extractTypeDeclaration(source, ['Node', 'Builder'])).toContain('int deep;');
+        expect(extractTypeDeclaration(source, ['Mode'])).toBe('public enum Mode { A, B }');
+    });
+
+    it('returns null for anonymous or missing classes', () => {
+        expect(extractTypeDeclaration(source, ['1'])).toBeNull();
+        expect(extractTypeDeclaration(source, ['Missing'])).toBeNull();
     });
 });

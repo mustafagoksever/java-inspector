@@ -17,6 +17,9 @@ const __dfDirname = path.dirname(__dfFilename);
 
 const execFileAsync = promisify(execFile);
 
+/** Bump when the way classes are passed to Vineflower changes (v2: nested classes + JAR as library). */
+const DECOMPILE_CACHE_SCHEME = 'v2';
+
 export class DecompilerService {
     private scanner: DependencyScanner;
 
@@ -118,20 +121,72 @@ export class DecompilerService {
     ): Promise<string> {
         const logger = Logger.get(contextPath);
         const fingerprint = await jarIndexer.fingerprint(jarPath);
+        const activeDecompilerPath = await this.resolveDecompilerPath(logger);
         const safeClassName = className.replace(/[^a-zA-Z0-9_$.-]/g, '_');
-        const cachePath = path.join(getResultCacheDir(contextPath), fingerprint.key, 'source', `${safeClassName}.java`);
+        // The decompiler JAR name and the extraction scheme are part of the key, so upgrading Vineflower
+        // (or changing how classes are fed to it) never serves stale output from an older run.
+        const decompilerKey = `${path.basename(activeDecompilerPath, '.jar').replace(/[^a-zA-Z0-9_.-]/g, '_')}-${DECOMPILE_CACHE_SCHEME}`;
+        const cachePath = path.join(getResultCacheDir(contextPath), fingerprint.key, 'source', decompilerKey, `${safeClassName}.java`);
         if (useCache && await fs.pathExists(cachePath)) return readFile(cachePath, 'utf8');
 
-        const activeDecompilerPath = await this.resolveDecompilerPath(logger);
-        let classFilePath: string | undefined;
+        const workDir = path.join(getClassTempDir(contextPath), `family-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
         try {
-            classFilePath = await this.extractClassFile(jarPath, className, contextPath, entryPath);
-            const source = await this.decompileWithVineflower(classFilePath, className, contextPath, activeDecompilerPath, logger);
+            // Vineflower only emits nested/anonymous class bodies when their Outer$*.class files are
+            // passed alongside the outer class; the JAR itself is added as a library for type resolution.
+            const outerEntry = entryPath || `${className.replace(/\./g, '/')}.class`;
+            const classFiles = await this.extractClassFamily(jarPath, outerEntry, workDir);
+            const source = await this.decompileWithVineflower(classFiles, className, contextPath, activeDecompilerPath, logger, [jarPath]);
             if (useCache) await fs.outputFile(cachePath, source, 'utf8');
             return source;
         } finally {
-            if (classFilePath) await fs.remove(classFilePath).catch(() => {});
+            await fs.remove(workDir).catch(() => {});
         }
+    }
+
+    /**
+     * Extract the outer class entry and all of its nested class entries (Outer$*.class)
+     * in a single pass over the JAR. Returns file paths with the outer class first.
+     */
+    private async extractClassFamily(jarPath: string, outerEntry: string, targetDir: string, maxEntries: number = 500): Promise<string[]> {
+        const nestedPrefix = `${outerEntry.replace(/\.class$/, '')}$`;
+        await fs.ensureDir(targetDir);
+        return new Promise((resolve, reject) => {
+            yauzl.open(jarPath, { lazyEntries: true }, (openError: any, zipfile: any) => {
+                if (openError || !zipfile) { reject(new Error(`Unable to open JAR package ${jarPath}: ${openError?.message}`)); return; }
+                const files: string[] = [];
+                let outerFile: string | undefined;
+                let settled = false;
+                const finish = (error?: Error) => {
+                    if (settled) return;
+                    settled = true;
+                    try { zipfile.close(); } catch { /* ignore */ }
+                    if (error) reject(error);
+                    else if (!outerFile) reject(new Error(`Class file ${outerEntry} not found in JAR package ${jarPath}`));
+                    else resolve([outerFile, ...files]);
+                };
+                zipfile.on('error', (error: Error) => finish(new Error(`Failed to read JAR package: ${error.message}`)));
+                zipfile.on('end', () => finish());
+                zipfile.on('entry', (entry: any) => {
+                    const name: string = entry.fileName;
+                    const isOuter = name === outerEntry;
+                    const isNested = !isOuter && name.startsWith(nestedPrefix) && name.endsWith('.class') && !name.slice(nestedPrefix.length).includes('/');
+                    if (!isOuter && (!isNested || files.length >= maxEntries)) { zipfile.readEntry(); return; }
+                    const target = path.join(targetDir, path.basename(name));
+                    zipfile.openReadStream(entry, (streamError: any, readStream: any) => {
+                        if (streamError) { finish(new Error(`Unable to read ${name}: ${streamError.message}`)); return; }
+                        const writeStream = createWriteStream(target);
+                        writeStream.on('error', (error: Error) => finish(new Error(`Failed to write temporary file: ${error.message}`)));
+                        writeStream.on('close', () => {
+                            if (isOuter) outerFile = target; else files.push(target);
+                            zipfile.readEntry();
+                        });
+                        readStream.on('error', (error: Error) => finish(new Error(`Unable to read ${name}: ${error.message}`)));
+                        readStream.pipe(writeStream);
+                    });
+                });
+                zipfile.readEntry();
+            });
+        });
     }
 
     /**
@@ -229,25 +284,28 @@ export class DecompilerService {
      * output folder, run the decompiler, read the generated .java file,
      * and clean up afterwards.
      */
-    private async decompileWithVineflower(classFilePath: string, className: string, projectPath: string, decompilerPath: string, logger?: Logger): Promise<string> {
+    private async decompileWithVineflower(classFilePath: string | string[], className: string, projectPath: string, decompilerPath: string, logger?: Logger, libraries: string[] = []): Promise<string> {
+        const sources = Array.isArray(classFilePath) ? classFilePath : [classFilePath];
         if (!decompilerPath) {
             throw new Error('Vineflower decompiler tool not found, please ensure Vineflower jar is in classpath');
         }
 
-        const outputDir = path.join(getClassTempDir(projectPath), `vine-out-${Date.now()}`);
+        const outputDir = path.join(getClassTempDir(projectPath), `vine-out-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
         await fs.ensureDir(outputDir);
 
         try {
             const javaCmd = this.getJavaCommand(logger);
-            const cmdMsg = `Executing Vineflower: ${javaCmd} -jar "${decompilerPath}" "${classFilePath}" "${outputDir}"`;
+            const vineArgs = ['-jar', decompilerPath, ...libraries.map(lib => `-e=${lib}`), ...sources, outputDir];
+            const cmdMsg = `Executing Vineflower: ${javaCmd} ${vineArgs.map(arg => `"${arg}"`).join(' ')}`;
             logger?.debug(`[DECOMPILE] ${cmdMsg}`);
             console.error(cmdMsg);
 
             const { stdout, stderr } = await execFileAsync(
                 javaCmd,
-                ['-jar', decompilerPath, classFilePath, outputDir],
+                vineArgs,
                 {
-                    timeout: 30000
+                    timeout: 30000,
+                    maxBuffer: 10 * 1024 * 1024,
                 }
             );
 
@@ -285,7 +343,7 @@ export class DecompilerService {
                 throw new Error('Vineflower decompilation timeout, please check Java environment and decompiler tool');
             }
             if (error instanceof Error && error.message.includes('UnsupportedClassVersionError')) {
-                throw new Error('Vineflower 1.11.2 requires Java 17 or newer. The active Java runtime is too old; update JAVA_HOME or PATH.');
+                throw new Error('Vineflower 1.12.0 requires Java 17 or newer. The active Java runtime is too old; update JAVA_HOME or PATH.');
             }
             throw new Error(`Vineflower decompilation failed: ${error instanceof Error ? error.message : String(error)}`);
         } finally {

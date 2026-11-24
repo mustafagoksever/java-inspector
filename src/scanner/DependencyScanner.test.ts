@@ -2,7 +2,7 @@ import { jest } from '@jest/globals';
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
-import { DependencyScanner } from './DependencyScanner.js';
+import { DependencyScanner, parseDependencyTree } from './DependencyScanner.js';
 import { projectCache } from '../cache/ProjectCache.js';
 import { CrossProcessLock } from '../utils/CrossProcessLock.js';
 import { Logger } from '../utils/Logger.js';
@@ -206,5 +206,30 @@ describe('DependencyScanner', () => {
                 await cleanupTestProject(project);
             }
         });
+    });
+});
+
+describe('parseDependencyTree', () => {
+    it('reads depth, scope, classifier and the parent of each dependency', () => {
+        const parsed = parseDependencyTree([
+            'demo:b:jar:1.0',
+            '+- demo:a:jar:1.0:compile',
+            '|  \\- org.apache.commons:commons-lang3:jar:3.14.0:compile',
+            '+- io.netty:netty-transport-native-epoll:jar:linux-x86_64:4.1.100.Final:runtime (optional)',
+            '\\- junit:junit:jar:4.13.2:test',
+            '   \\- org.hamcrest:hamcrest-core:jar:1.3:test',
+        ].join('\n'));
+        expect(parsed?.module).toBe('demo:b:1.0');
+        expect(parsed?.dependencies).toEqual([
+            { groupId: 'demo', artifactId: 'a', type: 'jar', version: '1.0', scope: 'compile', depth: 1, via: 'demo:b' },
+            { groupId: 'org.apache.commons', artifactId: 'commons-lang3', type: 'jar', version: '3.14.0', scope: 'compile', depth: 2, via: 'demo:a' },
+            { groupId: 'io.netty', artifactId: 'netty-transport-native-epoll', type: 'jar', classifier: 'linux-x86_64', version: '4.1.100.Final', scope: 'runtime', depth: 1, via: 'demo:b', optional: true },
+            { groupId: 'junit', artifactId: 'junit', type: 'jar', version: '4.13.2', scope: 'test', depth: 1, via: 'demo:b' },
+            { groupId: 'org.hamcrest', artifactId: 'hamcrest-core', type: 'jar', version: '1.3', scope: 'test', depth: 2, via: 'junit:junit' },
+        ]);
+    });
+
+    it('returns null for empty output', () => {
+        expect(parseDependencyTree('')).toBeNull();
     });
 });
