@@ -11,6 +11,12 @@ import { DependencyScanner } from './DependencyScanner.js';
 
 export interface ArtifactSelector {
     workspacePath?: string;
+    /**
+     * How long a lookup may wait for a Maven classpath that is still being resolved
+     * (cold start). 0 = do not wait, report complete=false instead.
+     */
+    classpathWaitMs?: number;
+    onWait?: (message: string) => Promise<void>;
     jarPath?: string;
     jarDirectory?: string;
     jarNamePrefix?: string;
@@ -111,7 +117,7 @@ export class ArtifactService {
 
         if (selector.workspacePath) {
             for (const contextPath of await this.getContextPaths(selector.workspacePath)) {
-                const classpath = await this.getMavenClasspath(contextPath);
+                const classpath = await this.getMavenClasspath(contextPath, selector);
                 mavenPending ||= classpath.pending;
                 if (classpath.error) errors.push(classpath.error);
                 for (const jarPath of classpath.jarPaths) {
@@ -189,7 +195,7 @@ export class ArtifactService {
         const classpaths = new Map<string, string[]>();
         let mavenPending = false;
         for (const context of contexts) {
-            const classpath = await this.getMavenClasspath(context);
+            const classpath = await this.getMavenClasspath(context, selector);
             classpaths.set(context, classpath.jarPaths);
             mavenPending ||= classpath.pending;
             if (classpath.error) errors.push(classpath.error);
@@ -235,7 +241,13 @@ export class ArtifactService {
             const state = await projectCache.getScanState(context);
             for (const jar of state?.processedJars ?? []) processed.add(path.resolve(jar));
         }
-        jarCandidates.sort((a, b) => Number(processed.has(path.resolve(a.jarPath))) - Number(processed.has(path.resolve(b.jarPath))));
+        // Unprocessed JARs first; for a qualified class name, JARs whose Maven path/name matches the
+        // package (org.apache.commons.lang3 -> org/apache/commons/commons-lang3) are opened first, so an
+        // exact lookup usually needs one JAR read even while the background index is incomplete.
+        const relevance = this.packageRelevance(query);
+        jarCandidates.sort((a, b) =>
+            Number(processed.has(path.resolve(a.jarPath))) - Number(processed.has(path.resolve(b.jarPath)))
+            || relevance(b.jarPath) - relevance(a.jarPath));
 
         let scannedJarCount = 0;
         let nestedRemaining = 0;
@@ -301,7 +313,8 @@ export class ArtifactService {
     }
 
     async resolveClass(className: string, selector: ArtifactSelector): Promise<ClassSearchResult> {
-        return this.searchClasses(className, selector, 50, 20);
+        // A fully qualified lookup is cheap with package-relevance ordering, so allow more JARs.
+        return this.searchClasses(className, selector, 50, className.includes('.') ? 60 : 20);
     }
 
     async searchCode(
@@ -532,7 +545,7 @@ export class ArtifactService {
         let pending = false;
         if (selector.workspacePath) {
             for (const contextPath of await this.getContextPaths(selector.workspacePath)) {
-                const classpath = await this.getMavenClasspath(contextPath);
+                const classpath = await this.getMavenClasspath(contextPath, selector);
                 pending ||= classpath.pending;
                 if (classpath.error) errors.push(classpath.error);
                 for (const jarPath of classpath.jarPaths) {
@@ -551,6 +564,7 @@ export class ArtifactService {
 
     private async getMavenClasspath(
         contextPath: string,
+        options: Pick<ArtifactSelector, 'classpathWaitMs' | 'onWait'> = {},
     ): Promise<{ jarPaths: string[]; pending: boolean; error?: ArtifactScanError }> {
         const cached = await projectCache.getClasspath(contextPath).catch(() => null);
         if (cached !== null) return { jarPaths: cached, pending: false };
@@ -566,7 +580,13 @@ export class ArtifactService {
             }
         }
 
-        const refreshed = await projectCache.getClasspath(contextPath).catch(() => null);
+        let refreshed = await projectCache.getClasspath(contextPath).catch(() => null);
+        if (refreshed === null && options.classpathWaitMs) {
+            await options.onWait?.('Waiting for Maven classpath resolution (first run for this project)...');
+            refreshed = await this.scanner.waitForClasspath(contextPath, options.classpathWaitMs, async elapsed => {
+                await options.onWait?.(`Still resolving Maven classpath (${Math.round(elapsed / 1000)}s)...`);
+            });
+        }
         return { jarPaths: refreshed ?? [], pending: refreshed === null };
     }
 
@@ -587,6 +607,23 @@ export class ArtifactService {
         const parts = normalized.split(/[\s.]+/).filter(Boolean);
         if (parts.length > 1 && parts.every(part => full.includes(part))) return 40 + parts.length * 5;
         return 0;
+    }
+
+    private packageRelevance(query: string): (jarPath: string) => number {
+        const trimmed = query.trim();
+        if (!/^[\w$]+(\.[\w$]+)+$/.test(trimmed)) return () => 0;
+        const generic = new Set(['org', 'com', 'io', 'net', 'java', 'javax', 'jakarta', 'internal', 'impl', 'api', 'util', 'core']);
+        const segments = trimmed.toLowerCase().split('.').slice(0, -1);
+        return (jarPath: string) => {
+            const parts = new Set(jarPath.toLowerCase().split(/[\\/._-]+/));
+            let score = 0;
+            segments.forEach((segment, index) => {
+                if (!parts.has(segment)) return;
+                // Leading package segments match the Maven groupId directories; distinctive ones weigh more.
+                score += (generic.has(segment) ? 1 : 3) + (index < 4 ? 1 : 0);
+            });
+            return score;
+        };
     }
 
     private isExactClassMatch(query: string, classes: JarClassEntry[]): boolean {

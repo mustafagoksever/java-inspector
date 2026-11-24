@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- On a cold start `inspect_class` answered "Class not found" while Maven was still resolving the classpath, which pushed agents to locate JARs in `~/.m2` and pass `jarPath`. Class lookups now wait (bounded) for the classpath, open the JAR matching the package first, and tool descriptions state that `className` alone is enough for Maven dependencies.
+
 - Tool failures were returned as JSON-RPC protocol errors (`-32603`) because handler promises were returned without `await` inside `try`; they are now `isError` tool results the model can read.
 - `inspect_class` silently fell back to a fuzzy match (e.g. a typo resolved to a different class). It now fails with "Class not found" and lists similar classes.
 - Decompiled source was missing nested/inner class bodies because only `Outer.class` was given to Vineflower. All `Outer$*.class` entries are now passed, plus the JAR as a library (`-e=`) for better type resolution. Temp directories are unique per call.

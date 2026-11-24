@@ -36,18 +36,19 @@ export const SERVER_INSTRUCTIONS = `java-inspector gives read-only access to com
 Prefer these tools over shell commands for anything inside a JAR or the JDK:
 - Instead of \`javap\` / \`javap -c\` / \`javap -p\`: inspect_class with view "api" (signatures) or "bytecode".
 - Instead of decompiling by hand or guessing library behaviour: inspect_class with view "source" (uses -sources.jar when present, otherwise Vineflower). Pass methodName to get a single method.
+- For classes from the project's Maven dependencies, pass only className (fully qualified). Do NOT look up the JAR in ~/.m2 or pass jarPath first: the server knows the project classpath and finds the JAR itself, waiting for Maven if the project is opened for the first time.
 - Instead of \`unzip -l\`, \`jar tf\`, \`find ~/.m2 -name\`, \`grep -r\` over JARs: search_class, find_jar, inspect_jar, search_resources, read_resource.
 - Instead of \`mvn dependency:tree\`: explain_dependency.
 - To find who implements an interface or calls/declares a member or uses a string: find_implementations / search_code.
 
-Workflow: search_class (simple or partial name) -> inspect_class (fully qualified name). No scan is required first: the Maven classpath is resolved in the background at startup and tools return partial results with complete=false instead of waiting. When a result is ambiguous, the response lists candidates; repeat the call with jarPath set to one of them. All paths must be absolute.`;
+Workflow: inspect_class with the fully qualified name; if you only know the simple name, search_class first. No scan is required first: the Maven classpath is resolved in the background at startup and tools return partial results with complete=false instead of waiting. When a result is ambiguous, the response lists candidates; repeat the call with jarPath set to one of them. All paths must be absolute.`;
 
 const FORMAT = z.enum(['text', 'json', 'toon']).default('text').describe('Response format. "text" is compact and human-readable; "json" returns the full structured result; "toon" is a token-efficient structured encoding.');
 const MODE = z.enum(['fast', 'balanced']).default('balanced').describe('"fast" opens fewer unindexed JARs per call (lower latency, more likely partial); "balanced" opens more.');
 const num = (description: string) => z.coerce.number().int().optional().describe(description);
 const SELECTOR = {
     workspacePath: z.string().optional().describe('Absolute path of the Java workspace (directory containing pom.xml, or a parent of several Maven projects). Defaults to the server cwd when no other selector is given.'),
-    jarPath: z.string().optional().describe('Absolute path to one exact JAR. Fastest and unambiguous; use it when a previous response listed candidate JARs.'),
+    jarPath: z.string().optional().describe('Absolute path to one exact JAR. Not needed for Maven dependencies of the workspace (they are resolved from the classpath). Use it for JARs outside the Maven classpath, or to choose one of the candidates a previous response listed.'),
     jarDirectory: z.string().optional().describe('Absolute directory to search for JARs on demand (for non-Maven projects, e.g. a lib/ folder).'),
     jarNamePrefix: z.string().optional().describe('Restrict to JARs whose file name starts with this, e.g. "spring-web" or "jackson-databind-2.17".'),
     coordinates: z.string().optional().describe('Maven coordinates groupId:artifactId[:version[:classifier]] resolved from the local repository, e.g. "com.fasterxml.jackson.core:jackson-databind".'),
@@ -134,7 +135,7 @@ export class JavaClassAnalyzerMCPServer {
         register('inspect_class', 'Inspect / decompile class',
             'Show a Java class from a Maven dependency, local JAR, or the JDK. view="source": real source from a -sources.jar if present, otherwise decompiled with Vineflower (inner classes included); pass methodName (and optionally paramTypes) to return a single method, or offset/limit to page large files. ' +
             'view="api": compact member signatures (replaces `javap -p`). view="bytecode": `javap -c -l -p -s` output. view="hierarchy": superclass chain and interfaces. view="all": everything. ' +
-            'Use this instead of running javap or a decompiler in the shell. Requires the fully qualified class name; use search_class first if you only know the simple name.',
+            'Use this instead of running javap or a decompiler in the shell. For Maven dependencies pass ONLY className: the JAR is found from the project classpath (no need to locate it in ~/.m2). jarPath/jarDirectory are for non-Maven JARs or to pick one of several candidates. Use search_class first if you only know the simple name.',
             {
                 className: z.string().describe('Fully qualified class name, e.g. "com.fasterxml.jackson.databind.ObjectMapper". Nested classes are included in the outer class source view.'),
                 ...SELECTOR,
@@ -216,7 +217,7 @@ export class JavaClassAnalyzerMCPServer {
         if (!args.query || typeof args.query !== 'string') throw new Error('query is required');
         const selector = await this.selectorFromArgs(args, true);
         await sendProgress?.(`Searching for class: ${args.query}`, 0, 100);
-        const result = await artifactService.searchClasses(args.query, selector, this.clamp(args.limit, 1, 100, 20), args.mode === 'fast' ? 5 : 20);
+        const result = await artifactService.searchClasses(args.query, { ...selector, classpathWaitMs: args.mode === 'fast' ? 0 : 30_000, onWait: message => sendProgress?.(message, 10, 100) ?? Promise.resolve() }, this.clamp(args.limit, 1, 100, 20), args.mode === 'fast' ? 5 : 20);
         const jdkResults = args.includeJdk ? await jdkSourceService.searchClasses(args.query, this.clamp(args.limit, 1, 100, 20)) : [];
         const structured = { ...result, jdkResults, backgroundScanProgress: await this.aggregateScanProgress(selector.workspacePath) };
         const totalResults = result.results.length + jdkResults.length;
@@ -261,7 +262,13 @@ export class JavaClassAnalyzerMCPServer {
             const result = await this.inspectJdkClass(args.className, contextPath, view, args);
             return this.formatResponse(this.classInspectionText(args.className, result), result, args.format);
         }
-        const resolved = await artifactService.resolveClass(args.className, selector);
+        // Single-class lookups may wait for a cold-start Maven resolution instead of failing immediately;
+        // otherwise agents give up and go hunting for JARs in ~/.m2 themselves.
+        const resolved = await artifactService.resolveClass(args.className, {
+            ...selector,
+            classpathWaitMs: 90_000,
+            onWait: message => sendProgress?.(message, 10, 100) ?? Promise.resolve(),
+        });
         const requested = String(args.className);
         const isQualified = requested.includes('.');
         // Never fall back to fuzzy matches here: silently decompiling "FooBar" when "Foo" was asked is worse than an error.
@@ -269,7 +276,9 @@ export class JavaClassAnalyzerMCPServer {
         const unique = this.uniqueClassCandidates(exact);
         if (!unique.length) {
             const suggestions = this.uniqueClassCandidates(resolved.results).slice(0, 10).map(item => `- ${item.className} -> ${item.jarPath}`);
-            const partial = resolved.complete ? '' : ' The dependency index is still being built, so it may appear later; narrowing with jarNamePrefix or jarPath searches the right JAR immediately.';
+            const partial = resolved.complete ? '' : (resolved.results.length === 0 && resolved.scannedJarCount === 0
+                ? ' The Maven classpath is still being resolved (first run for this project); call again in a moment with the same arguments.'
+                : ` ${resolved.remainingJarCount} dependency JAR(s) were not searched yet; call again with the same arguments.`);
             throw new Error(`Class not found: ${requested}.${partial}${suggestions.length ? `\nSimilar classes:\n${suggestions.join('\n')}` : ' Use search_class with a partial name.'}`);
         }
         if (unique.length > 1) return this.ambiguityResponse('Class', unique, args.format);

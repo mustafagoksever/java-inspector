@@ -149,6 +149,7 @@ Tool descriptions and `SERVER_INSTRUCTIONS` are what make agents choose these to
 After the transport connects, top-level `pom.xml` directories under `cwd` are discovered (bounded BFS) and scanned in the background. Other tools work immediately on the partial index and report `complete: false`.
 
 ### `inspect_class`
+- For Maven dependencies only `className` is needed; the JAR comes from the project classpath. On a cold start (classpath not resolved yet) the lookup waits up to 90 s for Maven (`DependencyScanner.waitForClasspath`, progress notifications sent) instead of failing; `search_class` waits up to 30 s in `balanced` mode. While the background index is incomplete, JARs whose Maven path matches the package (`ArtifactService.packageRelevance`) are opened first.
 - Requires an **exact** class name match (FQN, or simple name if unique). Never falls back to fuzzy matches; on a miss it errors with similar class suggestions.
 - `view=source`: embedded `.java` → `*-sources.jar` → Vineflower. Response states the source origin. `methodName`/`paramTypes` extract one method; `offset`/`limit` page lines and the response reports `Lines: x-y of N`.
 - `view=api`: `javap -p` output (plus class-file metadata in `json` format).

@@ -375,6 +375,39 @@ export class DependencyScanner {
     }
 
     /**
+     * Wait (bounded) for a classpath that is being resolved by this process or, via scan.lock,
+     * by another server process. Returns null if it is still unavailable when the time is up.
+     * Single-class lookups use this so a cold start does not answer "class not found" while
+     * Maven is still running.
+     */
+    async waitForClasspath(projectPath: string, timeoutMs: number, onWait?: (elapsedMs: number) => Promise<void>): Promise<string[] | null> {
+        const deadline = Date.now() + Math.max(0, timeoutMs);
+        const started = Date.now();
+        while (true) {
+            const cached = await projectCache.getClasspath(projectPath).catch(() => null);
+            if (cached !== null) return cached;
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) return null;
+            const inProcess = this.classpathPromises.get(projectPath);
+            if (inProcess) {
+                let timer: NodeJS.Timeout | undefined;
+                const result = await Promise.race([
+                    inProcess.then(paths => paths, () => null),
+                    new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), Math.min(remaining, 2_000)); }),
+                ]);
+                if (timer) clearTimeout(timer);
+                if (result === null) return null; // resolution failed; the error is reported by scanProject
+                if (result !== undefined) return result;
+            } else if (await CrossProcessLock.check(projectPath, 'scan')) {
+                await new Promise(resolve => setTimeout(resolve, Math.min(remaining, 500)));
+            } else {
+                return null;
+            }
+            await onWait?.(Date.now() - started);
+        }
+    }
+
+    /**
      * Find corresponding JAR package path by class name.
      * Uses cache + lazy on-demand scanning.
      */

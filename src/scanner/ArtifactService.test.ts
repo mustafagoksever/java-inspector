@@ -66,6 +66,42 @@ describe('ArtifactService', () => {
         }
     });
 
+    it('waits for a cold-start Maven classpath when classpathWaitMs is set', async () => {
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'java-inspector-wait-'));
+        fs.writeFileSync(path.join(root, 'pom.xml'), '<project/>');
+        const waitingScanner = {
+            isResolvingClasspath: jest.fn(() => true),
+            scanProject: jest.fn(),
+            waitForClasspath: jest.fn(async () => [jarPath]),
+        };
+        const waitingService = new ArtifactService(waitingScanner as any);
+        const messages: string[] = [];
+        try {
+            const result = await waitingService.resolveClass('org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler', {
+                workspacePath: root,
+                classpathWaitMs: 1_000,
+                onWait: async message => { messages.push(message); },
+            });
+            expect(waitingScanner.waitForClasspath).toHaveBeenCalled();
+            expect(messages[0]).toMatch(/Waiting for Maven classpath/);
+            expect(result.results[0]).toMatchObject({ className: 'org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler', jarPath, origin: 'maven' });
+        } finally {
+            await projectCache.invalidate(root).catch(() => {});
+            fs.rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it('ranks JARs whose Maven path matches the class package first', () => {
+        const relevance = (service as any).packageRelevance('org.apache.commons.lang3.StringUtils');
+        const repo = '/home/u/.m2/repository';
+        const lang = `${repo}/org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0.jar`;
+        const io = `${repo}/commons-io/commons-io/2.16.1/commons-io-2.16.1.jar`;
+        const slf4j = `${repo}/org/slf4j/slf4j-api/2.0.13/slf4j-api-2.0.13.jar`;
+        expect(relevance(lang)).toBeGreaterThan(relevance(io));
+        expect(relevance(io)).toBeGreaterThan(relevance(slf4j));
+        expect((service as any).packageRelevance('StringUtils')(lang)).toBe(0);
+    });
+
     it('does not append foreground scans to the project JSONL index', async () => {
         const append = jest.spyOn(projectCache, 'appendToClassIndex');
         try {
