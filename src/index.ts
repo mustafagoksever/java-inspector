@@ -9,10 +9,11 @@ import * as path from 'path';
 import fs from 'fs-extra';
 import { JavaClassAnalyzer, ClassAnalysis, HierarchyEntry } from './analyzer/JavaClassAnalyzer.js';
 import { jdkSourceService } from './analyzer/JdkSourceService.js';
-import { DependencyScanner } from './scanner/DependencyScanner.js';
+import { diffApi } from './analyzer/ApiDiff.js';
+import { DependencyNode, DependencyScanner, ModuleDependencies } from './scanner/DependencyScanner.js';
 import { DecompilerService } from './decompiler/DecompilerService.js';
 import { artifactService, ArtifactSelector, ClassCandidate } from './scanner/ArtifactService.js';
-import { jarIndexer } from './scanner/JarIndexer.js';
+import { DeepClassEntry, jarIndexer } from './scanner/JarIndexer.js';
 import { projectDiscovery } from './scanner/ProjectDiscovery.js';
 import { ClassFileMetadataReader } from './scanner/ClassFileMetadataReader.js';
 import { getResultCacheDir } from './utils/cachePaths.js';
@@ -56,7 +57,8 @@ Prefer these tools over shell commands for anything inside a JAR or the JDK:
 - Instead of decompiling by hand or guessing library behaviour: inspect_class with view "source" (uses -sources.jar when present, otherwise Vineflower). Pass methodName to get a single method; nested classes are addressed as Outer$Inner.
 - For classes from the project's Maven dependencies, pass only className (fully qualified). Do NOT look up the JAR in ~/.m2 or pass jarPath first: the server knows the project classpath and finds the JAR itself, waiting for Maven if the project is opened for the first time.
 - Instead of \`unzip -l\`, \`jar tf\`, \`find ~/.m2 -name\`, \`grep -r\` over JARs: search_class, find_jar, inspect_jar, search_resources, read_resource.
-- Instead of \`mvn dependency:tree\`: explain_dependency. For version conflicts / the same class in several JARs (NoSuchMethodError, ClassCastException): find_duplicates.
+- Before upgrading a library, or for NoSuchMethodError/AbstractMethodError: compare_versions (API diff between two versions).
+- Instead of \`mvn dependency:tree\` or reading pom.xml: list_dependencies (real versions, scope, direct/transitive); explain_dependency for why one artifact is there. For version conflicts / the same class in several JARs (NoSuchMethodError, ClassCastException): find_duplicates.
 - To find who implements an interface or calls/declares a member or uses a string: find_implementations / search_code.
 
 Workflow: inspect_class with the fully qualified name; if you only know the simple name, search_class first. No scan is required first: the Maven classpath is resolved in the background at startup and tools return partial results with complete=false instead of waiting. When a result is ambiguous, the response lists candidates; repeat the call with jarPath set to one of them. All paths must be absolute.`;
@@ -188,8 +190,40 @@ export class JavaClassAnalyzerMCPServer {
         register('explain_dependency', 'Explain dependency',
             'Explain why an artifact is on the classpath: runs a filtered `mvn dependency:tree -Dincludes=<coordinates> -Dverbose` for each Maven project in the workspace (paths from root to the artifact, conflicts, omitted versions). ' +
             'Use instead of running mvn dependency:tree yourself. Slower (runs Maven).',
-            { workspacePath: z.string().describe('Absolute workspace path containing pom.xml.'), coordinates: z.string().optional().describe('groupId:artifactId (or groupId only). Optional if jarPath is given.'), jarPath: z.string().optional().describe('Absolute JAR path; coordinates are read from its pom.properties.'), format: FORMAT },
+            { workspacePath: z.string().optional().describe('Absolute workspace path containing pom.xml. Defaults to the server cwd.'), coordinates: z.string().optional().describe('groupId:artifactId (or groupId only). Optional if jarPath is given.'), jarPath: z.string().optional().describe('Absolute JAR path; coordinates are read from its pom.properties.'), format: FORMAT },
             (args, progress) => this.handleExplainDependency(args, progress));
+
+        register('compare_versions', 'Compare API between versions',
+            'Binary API diff of a library between two versions (or any two JARs): added/removed classes, and per class the public/protected methods and fields that were added, removed or changed (visibility, static, final, abstract, supertypes), with breaking changes flagged. ' +
+            'Use before upgrading a dependency, or to explain NoSuchMethodError/AbstractMethodError, instead of decompiling both versions and comparing by hand. ' +
+            'Give coordinates + toVersion (fromVersion defaults to the version on the project classpath), or fromJarPath + toJarPath. Then inspect_class with jarPath shows the code of a changed member.',
+            {
+                coordinates: z.string().optional().describe('groupId:artifactId, e.g. "com.fasterxml.jackson.core:jackson-databind".'),
+                fromVersion: z.string().optional().describe('Old version. Default: the version on the workspace classpath.'),
+                toVersion: z.string().optional().describe('New version (required with coordinates).'),
+                fromJarPath: z.string().optional().describe('Absolute path of the old JAR (instead of coordinates/fromVersion).'),
+                toJarPath: z.string().optional().describe('Absolute path of the new JAR (instead of coordinates/toVersion).'),
+                className: z.string().optional().describe('Compare only this class (fully qualified; its nested classes are included).'),
+                packagePrefix: z.string().optional().describe('Compare only classes in this package and its subpackages, e.g. "org.apache.commons.lang3.time".'),
+                download: z.boolean().default(false).describe('Download a version missing from ~/.m2 with `mvn dependency:get` (network).'),
+                workspacePath: z.string().optional().describe('Absolute workspace path used to find the classpath version. Defaults to the server cwd.'),
+                limit: num('Max changed classes listed in the text output (1-500, default 40).'),
+                format: FORMAT,
+            },
+            (args, progress) => this.handleCompareVersions(args, progress));
+
+        register('list_dependencies', 'List Maven dependencies',
+            'Resolved dependencies of every Maven module in the workspace with groupId:artifactId:version, scope, and whether each is direct (declared in the pom) or transitive (with the path that pulls it in). ' +
+            'Use instead of running `mvn dependency:tree` or reading pom.xml files to find out which version of a library the project really uses. Runs Maven once, then cached until pom.xml changes.',
+            {
+                workspacePath: z.string().optional().describe('Absolute workspace path containing pom.xml. Defaults to the server cwd.'),
+                query: z.string().optional().describe('Only dependencies whose groupId:artifactId contains this (case-insensitive), e.g. "jackson" or "org.slf4j"; each match is shown with its path from the module.'),
+                directOnly: z.boolean().default(false).describe('Only dependencies declared directly in the module poms.'),
+                scope: z.string().optional().describe('Only this scope: compile, runtime, test, provided, system or import.'),
+                limit: num('Max dependency lines in the text output (1-2000, default 300).'),
+                format: FORMAT,
+            },
+            (args, progress) => this.handleListDependencies(args, progress));
 
         register('search_resources', 'Search JAR resources',
             'Find non-class files inside JARs (META-INF/spring/*.imports, META-INF/services/*, *.properties, *.xml, *.json ...) by path substring and optionally by text content. ' +
@@ -402,8 +436,129 @@ export class JavaClassAnalyzerMCPServer {
         return this.formatResponse(this.classInspectionText(candidate.className, result), result, args.format);
     }
 
+    private async handleCompareVersions(args: any, sendProgress?: Progress) {
+        const workspacePath = args.workspacePath ? await this.validateWorkspacePath(args.workspacePath) : process.cwd();
+        const [groupId, artifactId] = typeof args.coordinates === 'string' ? args.coordinates.split(':') : [];
+        if (args.coordinates && (!groupId || !artifactId)) throw new Error('coordinates must be groupId:artifactId');
+        const notes: string[] = [];
+        const resolveJar = async (label: 'from' | 'to', jarPath?: string, version?: string): Promise<{ jarPath: string; version?: string }> => {
+            if (jarPath) {
+                if (!path.isAbsolute(jarPath) || !(await fs.pathExists(jarPath))) throw new Error(`${label}JarPath does not exist or is not absolute: ${jarPath}`);
+                return { jarPath: path.resolve(jarPath), version: artifactService.coordinatesFromJarPath(jarPath).version };
+            }
+            if (!groupId) throw new Error(`Give coordinates (groupId:artifactId) or ${label}JarPath.`);
+            if (!version && label === 'from') {
+                const found = await artifactService.findJars({ workspacePath, jarNamePrefix: `${artifactId}-`, classpathWaitMs: 60_000 }, 'prefix', 50);
+                const match = found.results.find(item => { const c = artifactService.coordinatesFromJarPath(item.jarPath); return c.groupId === groupId && c.artifactId === artifactId; });
+                if (!match) throw new Error(`${groupId}:${artifactId} is not on the classpath of ${workspacePath}; pass fromVersion or fromJarPath.`);
+                notes.push(`fromVersion taken from the project classpath.`);
+                return { jarPath: match.jarPath, version: artifactService.coordinatesFromJarPath(match.jarPath).version };
+            }
+            if (!version) throw new Error(`${label}Version is required with coordinates.`);
+            let jar = (await artifactService.findCoordinateJars(`${groupId}:${artifactId}:${version}`))[0];
+            if (!jar && args.download) {
+                await sendProgress?.(`Downloading ${groupId}:${artifactId}:${version}`, 10, 100);
+                const result = await this.scanner.downloadArtifact(workspacePath, { groupId, artifactId, version });
+                jar = (await artifactService.findCoordinateJars(`${groupId}:${artifactId}:${version}`))[0];
+                if (!jar) throw new Error(`Could not download ${groupId}:${artifactId}:${version}${result.message ? `: ${result.message}` : ''}`);
+                notes.push(`Downloaded ${groupId}:${artifactId}:${version}.`);
+            }
+            if (!jar) throw new Error(`${groupId}:${artifactId}:${version} is not in the local Maven repository. Pass download: true to fetch it with mvn dependency:get.`);
+            return { jarPath: jar, version };
+        };
+        const from = await resolveJar('from', args.fromJarPath, args.fromVersion);
+        const to = await resolveJar('to', args.toJarPath, args.toVersion);
+        await sendProgress?.('Reading class files of both versions', 40, 100);
+        const select = (classes: DeepClassEntry[]) => classes.filter(cls => !cls.entryPath.startsWith('META-INF/versions/')
+            && (!args.className || cls.className === args.className || cls.className.startsWith(`${args.className}$`))
+            && (!args.packagePrefix || cls.className.startsWith(`${String(args.packagePrefix).replace(/\.$/, '')}.`)));
+        const [fromIndex, toIndex] = await Promise.all([jarIndexer.getDeepIndex(from.jarPath, workspacePath), jarIndexer.getDeepIndex(to.jarPath, workspacePath)]);
+        const fromClasses = select(fromIndex.classes);
+        const toClasses = select(toIndex.classes);
+        if (args.className && !fromClasses.length && !toClasses.length) throw new Error(`${args.className} exists in neither JAR.`);
+        const diff = diffApi(fromClasses, toClasses);
+        const limit = this.clamp(args.limit, 1, 500, 40);
+        const label = (side: { jarPath: string; version?: string }) => side.version && groupId ? side.version : path.basename(side.jarPath);
+        const listNames = (names: string[], max = 50) => names.slice(0, max).join(', ') + (names.length > max ? `, ... (${names.length - max} more)` : '');
+        const lines = [
+            `API diff${groupId ? ` of ${groupId}:${artifactId}` : ''}: ${label(from)} -> ${label(to)}`,
+            `From: ${from.jarPath}`,
+            `To:   ${to.jarPath}`,
+            ...notes,
+            `Public classes: ${diff.addedClasses.length} added, ${diff.removedClasses.length} removed, ${diff.changedClasses.length} changed, ${diff.unchangedClassCount} unchanged. Breaking changes: ${diff.breakingChangeCount}.`,
+        ];
+        if (diff.removedClasses.length) lines.push('', `Removed classes (breaking): ${listNames(diff.removedClasses)}`);
+        if (diff.addedClasses.length) lines.push('', `Added classes: ${listNames(diff.addedClasses)}`);
+        if (diff.changedClasses.length) {
+            lines.push('', 'Changed classes:');
+            for (const cls of diff.changedClasses.slice(0, limit)) {
+                lines.push(`${cls.breaking ? '[BREAKING] ' : ''}${cls.className}`);
+                for (const change of cls.classChanges) lines.push(`    * ${change}`);
+                for (const member of cls.removed) lines.push(`    - ${member}`);
+                for (const change of cls.changed) lines.push(`    ~ ${change.member}: ${change.change}${change.breaking ? ' (breaking)' : ''}`);
+                for (const member of cls.added) lines.push(`    + ${member}`);
+            }
+            if (diff.changedClasses.length > limit) lines.push(`... ${diff.changedClasses.length - limit} more changed class(es); narrow with className/packagePrefix or raise limit.`);
+        }
+        if (!diff.addedClasses.length && !diff.removedClasses.length && !diff.changedClasses.length) lines.push('', 'No public/protected API differences.');
+        lines.push('', 'Legend: - removed, + added, ~ changed, * class-level change. Only public/protected, non-synthetic members are compared; method bodies are not.');
+        return this.formatResponse(lines.join('\n'), { from, to, ...diff }, args.format);
+    }
+
+    private async handleListDependencies(args: any, sendProgress?: Progress) {
+        const workspacePath = await this.validateWorkspacePath(args.workspacePath ?? process.cwd());
+        const contexts = await projectDiscovery.findTopLevelPomDirectories(workspacePath);
+        if (!contexts.length) throw new Error(`No pom.xml found under ${workspacePath}; list_dependencies needs a Maven project.`);
+        const query = typeof args.query === 'string' ? args.query.toLowerCase() : '';
+        const limit = this.clamp(args.limit, 1, 2000, 300);
+        const projects: Array<{ projectPath: string; modules?: Array<ModuleDependencies & { directCount: number; transitiveCount: number }>; error?: string }> = [];
+        for (let i = 0; i < contexts.length; i++) {
+            await sendProgress?.(`Resolving dependency tree of ${path.basename(contexts[i])}`, i, contexts.length);
+            try {
+                const { modules } = await this.scanner.listDependencies(contexts[i]);
+                projects.push({
+                    projectPath: contexts[i],
+                    modules: modules.map(module => {
+                        // Keep each match's ancestors so the path is visible (query) and direct-only/scope filters apply per node.
+                        const stack: string[] = [];
+                        const dependencies = module.dependencies.filter(dep => {
+                            stack.length = dep.depth - 1;
+                            stack.push(`${dep.groupId}:${dep.artifactId}`);
+                            if (args.directOnly && dep.depth > 1) return false;
+                            if (args.scope && dep.scope !== args.scope) return false;
+                            return !query || stack[stack.length - 1].toLowerCase().includes(query);
+                        });
+                        return { module: module.module, dependencies, directCount: module.dependencies.filter(dep => dep.depth === 1).length, transitiveCount: module.dependencies.filter(dep => dep.depth > 1).length };
+                    }),
+                });
+            } catch (error) {
+                projects.push({ projectPath: contexts[i], error: error instanceof Error ? error.message : String(error) });
+            }
+        }
+        let remaining = limit;
+        let truncated = 0;
+        const render = (dep: DependencyNode) => `${dep.groupId}:${dep.artifactId}:${dep.version}${dep.classifier ? `:${dep.classifier}` : ''}${dep.type !== 'jar' ? ` (${dep.type})` : ''} [${dep.scope ?? '?'}]${dep.optional ? ' optional' : ''}`;
+        const text = projects.map(project => {
+            if (project.error) return `Project: ${project.projectPath}\nError: ${project.error}`;
+            const filtered = Boolean(query || args.directOnly || args.scope);
+            const shown = project.modules!.filter(module => module.dependencies.length || (!filtered && module.directCount));
+            if (!shown.length) return `Project: ${project.projectPath}\nNo ${filtered ? 'matching ' : ''}dependencies.`;
+            return shown.map(module => {
+                const header = `Module ${module.module}: ${module.directCount} direct, ${module.transitiveCount} transitive${query || args.directOnly || args.scope ? `; ${module.dependencies.length} shown` : ''}`;
+                const rows = module.dependencies.flatMap(dep => {
+                    if (remaining <= 0) { truncated++; return []; }
+                    remaining--;
+                    if (query) return [`- ${render(dep)}${dep.depth > 1 ? ` (transitive, via ${dep.via})` : ' (direct)'}`];
+                    return [`${'  '.repeat(dep.depth - 1)}${dep.depth === 1 ? '- ' : '\\- '}${render(dep)}`];
+                });
+                return [header, ...rows].join('\n');
+            }).join('\n\n');
+        }).join('\n\n') + (truncated ? `\n\n${truncated} more dependency line(s) not shown; narrow with query, directOnly or scope, or raise limit.` : '');
+        return this.formatResponse(text, { projects }, args.format);
+    }
+
     private async handleExplainDependency(args: any, sendProgress?: Progress) {
-        const workspacePath = await this.validateWorkspacePath(args.workspacePath);
+        const workspacePath = await this.validateWorkspacePath(args.workspacePath ?? process.cwd());
         let coordinates = args.coordinates as string | undefined;
         if (!coordinates && args.jarPath) {
             const inspected = await artifactService.inspectJar({ jarPath: args.jarPath, workspacePath });

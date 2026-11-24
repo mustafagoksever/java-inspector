@@ -61,6 +61,8 @@ describe('JavaClassAnalyzerMCPServer', () => {
                 'find_duplicates',
                 'inspect_class',
                 'explain_dependency',
+                'compare_versions',
+                'list_dependencies',
                 'search_resources',
                 'read_resource',
             ]);

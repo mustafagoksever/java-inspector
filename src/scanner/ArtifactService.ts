@@ -832,7 +832,7 @@ export class ArtifactService {
         return coordinates.split(':')[1] || coordinates;
     }
 
-    private async findCoordinateJars(coordinates: string): Promise<string[]> {
+    async findCoordinateJars(coordinates: string): Promise<string[]> {
         const [groupId, artifactId, version, classifier] = coordinates.split(':');
         if (!groupId || !artifactId) return [];
         const repository = path.resolve(process.env.MAVEN_REPO || path.join(os.homedir(), '.m2', 'repository'));

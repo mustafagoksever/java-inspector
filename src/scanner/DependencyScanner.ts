@@ -1,5 +1,6 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import * as os from 'os';
 import * as path from 'path';
 import fs from 'fs-extra';
 import { projectCache } from '../cache/ProjectCache.js';
@@ -18,6 +19,55 @@ export interface ScanResult {
     status: 'complete' | 'in_progress';
     progress?: { processed: number; total: number };
     message?: string;
+}
+
+export interface DependencyNode {
+    groupId: string;
+    artifactId: string;
+    version: string;
+    type: string;
+    classifier?: string;
+    scope?: string;
+    optional?: boolean;
+    /** 1 = declared in the module's pom (direct), >1 = transitive. */
+    depth: number;
+    /** groupId:artifactId of the dependency that pulled this one in (direct dependencies: the module). */
+    via?: string;
+}
+
+export interface ModuleDependencies {
+    module: string;
+    dependencies: DependencyNode[];
+}
+
+/** Parse the text output of `mvn dependency:tree -DoutputFile=...` (one module per file). */
+export function parseDependencyTree(text: string): ModuleDependencies | null {
+    const lines = text.split(/\r?\n/).filter(line => line.trim());
+    if (!lines.length) return null;
+    const parse = (token: string) => {
+        const parts = token.split(':');
+        if (parts.length < 4) return null;
+        const [groupId, artifactId, type] = parts;
+        if (parts.length === 4) return { groupId, artifactId, type, version: parts[3] };
+        if (parts.length === 5) return { groupId, artifactId, type, version: parts[3], scope: parts[4] };
+        return { groupId, artifactId, type, classifier: parts[3], version: parts[4], scope: parts[5] };
+    };
+    const root = parse(lines[0].trim().split(/\s+/)[0]);
+    if (!root) return null;
+    const module = `${root.groupId}:${root.artifactId}:${root.version}`;
+    const stack: string[] = [`${root.groupId}:${root.artifactId}`];
+    const dependencies: DependencyNode[] = [];
+    for (const line of lines.slice(1)) {
+        const prefix = line.match(/^[| +\\-]*/)?.[0] ?? '';
+        const depth = Math.max(1, Math.round(prefix.length / 3));
+        const body = line.substring(prefix.length).trim();
+        const node = parse(body.split(/\s+/)[0]);
+        if (!node) continue;
+        stack.length = depth;
+        dependencies.push({ ...node, depth, via: stack[depth - 1], ...(/\(optional\)/.test(body) ? { optional: true } : {}) });
+        stack[depth] = `${node.groupId}:${node.artifactId}`;
+    }
+    return { module, dependencies };
 }
 
 export class DependencyScanner {
@@ -306,6 +356,7 @@ export class DependencyScanner {
         await onProgress?.(`Running Maven: ${mavenCmd} dependency:build-classpath...`, 5, 100);
 
         const start = performance.now();
+        let recovered: string[] | null = null;
         try {
             const { stdout, stderr } = await execFileAsync(
                 mavenCmd,
@@ -333,11 +384,12 @@ export class DependencyScanner {
             if (error.stderr) details += `\nstderr: ${error.stderr}`;
             if (error.code) details += `\nexit code: ${error.code}`;
             logger.error(`[MAVEN] Command failed after ${duration}s: ${error.message}${details}`);
-            throw new Error(`Maven command failed: ${error.message}${details}`);
+            recovered = await this.recoverReactorClasspath(projectPath, mavenCmd, outputFile, details);
+            if (!recovered) throw new Error(`Maven command failed: ${error.message}${details}`);
         }
 
         const outputFiles = (await fs.readdir(outputDir)).filter(name => name.endsWith('.txt')).sort();
-        if (outputFiles.length === 0) {
+        if (outputFiles.length === 0 && !recovered?.length) {
             throw new Error('Maven did not produce classpath output file');
         }
         const contents: string[] = [];
@@ -350,7 +402,8 @@ export class DependencyScanner {
             .flatMap(content => content.split(/\r?\n/))
             .flatMap(line => line.split(path.delimiter))
             .map(p => p.trim())
-            .filter(p => p.length > 0 && p.endsWith('.jar')))];
+            .filter(p => p.length > 0 && p.endsWith('.jar'))
+            .concat(recovered ?? []))];
         logger.info(`[MAVEN] Read classpath of ${outputFiles.length} module(s).`);
 
         // Validate paths exist
@@ -477,13 +530,18 @@ export class DependencyScanner {
      * Opt-in: it reaches the network. Returns Maven's error output on failure.
      */
     async downloadSources(projectPath: string, coordinates: { groupId: string; artifactId: string; version: string }): Promise<{ ok: boolean; message?: string }> {
+        return this.downloadArtifact(projectPath, coordinates, 'sources');
+    }
+
+    /** `mvn dependency:get` for one artifact (no transitives) into the local repository. Opt-in: it reaches the network. */
+    async downloadArtifact(projectPath: string, coordinates: { groupId: string; artifactId: string; version: string }, classifier?: string): Promise<{ ok: boolean; message?: string }> {
         const gav = `${coordinates.groupId}:${coordinates.artifactId}:${coordinates.version}`;
         if (!/^[\w.\-]+:[\w.\-]+:[\w.\-+]+$/.test(gav)) return { ok: false, message: `Invalid coordinates: ${gav}` };
         const mavenCmd = await this.resolveMavenCommand(projectPath);
         const logger = Logger.get(projectPath);
-        logger.info(`[MAVEN] Downloading sources for ${gav}`);
+        logger.info(`[MAVEN] Downloading ${gav}${classifier ? `:${classifier}` : ''}`);
         try {
-            await execFileAsync(mavenCmd, ['-B', '-q', 'dependency:get', `-Dartifact=${gav}:jar:sources`, '-Dtransitive=false'], {
+            await execFileAsync(mavenCmd, ['-B', '-q', 'dependency:get', `-Dartifact=${gav}:jar${classifier ? `:${classifier}` : ''}`, '-Dtransitive=false'], {
                 cwd: projectPath,
                 timeout: 120000,
                 shell: process.platform === 'win32',
@@ -492,9 +550,87 @@ export class DependencyScanner {
             return { ok: true };
         } catch (error: any) {
             const output = `${error?.stdout ?? ''}\n${error?.stderr ?? ''}`.split('\n').filter(line => /ERROR|Could not/.test(line)).slice(0, 3).join(' ').trim();
-            logger.info(`[MAVEN] Sources download failed for ${gav}: ${output || error?.message}`);
+            logger.info(`[MAVEN] Download failed for ${gav}: ${output || error?.message}`);
             return { ok: false, message: output || String(error?.message ?? error) };
         }
+    }
+
+    /**
+     * A multi-module checkout whose modules depend on each other fails `dependency:build-classpath` on Maven 3
+     * until the sibling modules are installed ("Could not resolve dependencies ... demo:a:jar"). Recover by
+     * re-running with --fail-at-end (modules that resolve still write their file) and adding the external
+     * dependencies of the dependency tree (which only needs poms) that exist in the local repository.
+     */
+    private async recoverReactorClasspath(projectPath: string, mavenCmd: string, outputFile: string, details: string): Promise<string[] | null> {
+        if (!/Could not resolve dependencies|was not found in|Could not find artifact/.test(details)) return null;
+        const logger = Logger.get(projectPath);
+        logger.info('[MAVEN] Classpath resolution failed on a module dependency; retrying with --fail-at-end and dependency:tree (unbuilt sibling modules?)');
+        await execFileAsync(mavenCmd, ['-B', '-q', '-fae', 'dependency:build-classpath', `-Dmdep.outputFile=${outputFile}`], {
+            cwd: projectPath, timeout: 300000, shell: process.platform === 'win32', maxBuffer: 10 * 1024 * 1024,
+        }).catch(() => {});
+        let modules: ModuleDependencies[];
+        try {
+            modules = await this.runDependencyTree(projectPath, mavenCmd);
+        } catch (error) {
+            logger.error(`[MAVEN] dependency:tree fallback failed: ${error instanceof Error ? error.message : String(error)}`);
+            return null;
+        }
+        const reactor = new Set(modules.map(module => module.module.split(':').slice(0, 2).join(':')));
+        const repository = path.resolve(process.env.MAVEN_REPO || path.join(os.homedir(), '.m2', 'repository'));
+        const jars: string[] = [];
+        let missing = 0;
+        for (const dep of modules.flatMap(module => module.dependencies)) {
+            if (reactor.has(`${dep.groupId}:${dep.artifactId}`) || (dep.type !== 'jar' && dep.type !== 'bundle' && dep.type !== 'test-jar')) continue;
+            const classifier = dep.classifier ?? (dep.type === 'test-jar' ? 'tests' : undefined);
+            const jar = path.join(repository, ...dep.groupId.split('.'), dep.artifactId, dep.version, `${dep.artifactId}-${dep.version}${classifier ? `-${classifier}` : ''}.jar`);
+            if (await fs.pathExists(jar)) jars.push(jar); else missing++;
+        }
+        logger.info(`[MAVEN] Recovered ${jars.length} JAR(s) from the dependency tree of ${modules.length} module(s)${missing ? `; ${missing} not downloaded yet` : ''}. Reactor modules are skipped (their code is in the workspace).`);
+        return jars;
+    }
+
+    private async runDependencyTree(projectPath: string, mavenCmd: string): Promise<ModuleDependencies[]> {
+        const outputDir = path.join(getProjectCacheDir(projectPath), `maven-tree-${process.pid}-${Date.now()}`);
+        await fs.ensureDir(outputDir);
+        const outputFile = path.join(outputDir, 'tree-${project.groupId}__${project.artifactId}.txt');
+        try {
+            try {
+                await execFileAsync(mavenCmd, ['-B', '-q', 'dependency:tree', `-DoutputFile=${outputFile}`, '-DoutputType=text'], {
+                    cwd: projectPath, timeout: 300000, shell: process.platform === 'win32', maxBuffer: 10 * 1024 * 1024,
+                });
+            } catch (error: any) {
+                const details = `${error?.stdout ?? ''}\n${error?.stderr ?? ''}`.split('\n').filter(line => /ERROR/.test(line)).slice(0, 5).join('\n');
+                throw new Error(`mvn dependency:tree failed: ${error?.message?.split('\n')[0] ?? error}${details ? `\n${details}` : ''}`);
+            }
+            const modules: ModuleDependencies[] = [];
+            for (const name of (await fs.readdir(outputDir)).filter(file => file.endsWith('.txt')).sort()) {
+                const parsed = parseDependencyTree(await fs.readFile(path.join(outputDir, name), 'utf-8'));
+                if (parsed) modules.push(parsed);
+            }
+            if (!modules.length) throw new Error('Maven did not produce dependency:tree output');
+            return modules;
+        } finally {
+            await fs.remove(outputDir).catch(() => {});
+        }
+    }
+
+    /**
+     * Resolved dependency tree of every reactor module (`mvn dependency:tree`, one output file per module).
+     * Cached per project until pom.xml or the resolved classpath changes.
+     */
+    async listDependencies(projectPath: string): Promise<{ modules: ModuleDependencies[]; cached: boolean }> {
+        const key = `${await projectCache.getPomHash(projectPath).catch(() => '')}:${projectCache.getClasspathHash((await projectCache.getClasspath(projectPath).catch(() => null)) ?? [])}`;
+        const cacheFile = path.join(getProjectCacheDir(projectPath), 'dependency-tree.json');
+        const cached = await fs.readJson(cacheFile).catch(() => null);
+        if (cached?.key === key && Array.isArray(cached.modules)) return { modules: cached.modules, cached: true };
+
+        const logger = Logger.get(projectPath);
+        const start = performance.now();
+        logger.info('[MAVEN] Running dependency:tree for list_dependencies');
+        const modules = await this.runDependencyTree(projectPath, await this.resolveMavenCommand(projectPath));
+        logger.info(`[MAVEN] Dependency tree of ${modules.length} module(s) in ${((performance.now() - start) / 1000).toFixed(1)}s`);
+        await fs.writeJson(cacheFile, { key, modules }).catch(() => {});
+        return { modules, cached: false };
     }
 
     private async withClasspathResolutionSlot<T>(task: () => Promise<T>): Promise<T> {
