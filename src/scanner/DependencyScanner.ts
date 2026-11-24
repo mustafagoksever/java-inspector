@@ -9,6 +9,7 @@ import { lazyResolver, ScoredClassEntry } from './LazyResolver.js';
 import { getProjectCacheDir } from '../utils/cachePaths.js';
 import { Logger } from '../utils/Logger.js';
 import { CrossProcessLock } from '../utils/CrossProcessLock.js';
+import { buildToolOf } from './ProjectDiscovery.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -69,6 +70,29 @@ export function parseDependencyTree(text: string): ModuleDependencies | null {
     }
     return { module, dependencies };
 }
+
+const GRADLE_INIT_SCRIPT = `
+allprojects { p ->
+    p.tasks.register('javaInspectorClasspath') {
+        doLast {
+            def outDir = new File(System.getProperty('javaInspector.out'))
+            def files = new LinkedHashSet<File>()
+            ['compileClasspath', 'runtimeClasspath', 'testCompileClasspath', 'testRuntimeClasspath'].each { name ->
+                def conf = p.configurations.findByName(name)
+                if (conf != null && conf.canBeResolved) {
+                    try {
+                        files.addAll(conf.incoming.artifactView { lenient = true }.files.files)
+                    } catch (Exception e) {
+                        p.logger.warn("java-inspector: could not resolve " + p.path + ":" + name + ": " + e.message)
+                    }
+                }
+            }
+            def safe = p.path.replaceAll('[^A-Za-z0-9_.-]', '_')
+            new File(outDir, "cp-" + (safe ?: 'root') + ".txt").text = files.collect { it.absolutePath }.join('\\n')
+        }
+    }
+}
+`;
 
 export class DependencyScanner {
     private static instance: DependencyScanner;
@@ -337,6 +361,7 @@ export class DependencyScanner {
         projectPath: string,
         onProgress?: (message: string, progress?: number, total?: number) => Promise<void>
     ): Promise<string[]> {
+        if (await buildToolOf(projectPath) === 'gradle') return this.getGradleClasspath(projectPath, onProgress);
         const logger = Logger.get(projectPath);
         const mavenCmd = await this.resolveMavenCommand(projectPath);
         const cacheDir = getProjectCacheDir(projectPath);
@@ -508,6 +533,7 @@ export class DependencyScanner {
     }
 
     async explainDependency(projectPath: string, coordinates: string): Promise<string> {
+        if (await buildToolOf(projectPath) === 'gradle') throw new Error(`explain_dependency supports Maven only; for this Gradle build run \`gradle dependencyInsight --dependency ${coordinates}\`.`);
         if (!coordinates || /[&|;<>$()]/.test(coordinates)) {
             throw new Error('coordinates is required and may not contain shell metacharacters');
         }
@@ -553,6 +579,58 @@ export class DependencyScanner {
             logger.info(`[MAVEN] Download failed for ${gav}: ${output || error?.message}`);
             return { ok: false, message: output || String(error?.message ?? error) };
         }
+    }
+
+    /**
+     * Gradle: an init script adds a task to every project that writes the resolved compile/runtime/test
+     * classpath files (lenient, so one unresolvable dependency does not lose the rest) to one file per project.
+     */
+    private async getGradleClasspath(
+        projectPath: string,
+        onProgress?: (message: string, progress?: number, total?: number) => Promise<void>,
+    ): Promise<string[]> {
+        const logger = Logger.get(projectPath);
+        const gradleCmd = await this.resolveGradleCommand(projectPath);
+        const outputDir = path.join(getProjectCacheDir(projectPath), `gradle-cp-${process.pid}`);
+        await fs.remove(outputDir).catch(() => {});
+        await fs.ensureDir(outputDir);
+        const initScript = path.join(outputDir, 'java-inspector-init.gradle');
+        await fs.writeFile(initScript, GRADLE_INIT_SCRIPT, 'utf-8');
+        logger.info(`[GRADLE] Running: ${gradleCmd} javaInspectorClasspath`);
+        await onProgress?.(`Running Gradle: ${gradleCmd} (resolving classpath)...`, 5, 100);
+        const start = performance.now();
+        try {
+            await execFileAsync(gradleCmd, ['-q', '--console=plain', '--no-configuration-cache', '--init-script', initScript, `-DjavaInspector.out=${outputDir}`, 'javaInspectorClasspath'], {
+                cwd: projectPath,
+                timeout: 300000,
+                shell: process.platform === 'win32',
+                maxBuffer: 10 * 1024 * 1024,
+            });
+            const contents = await Promise.all((await fs.readdir(outputDir)).filter(name => name.endsWith('.txt')).map(name => fs.readFile(path.join(outputDir, name), 'utf-8')));
+            if (!contents.length) throw new Error('Gradle did not produce classpath output (no Java projects?)');
+            const jars = [...new Set(contents.flatMap(content => content.split(/\r?\n/)).map(line => line.trim()).filter(line => line.endsWith('.jar')))];
+            const existing: string[] = [];
+            for (const jar of jars) if (await fs.pathExists(jar)) existing.push(jar);
+            logger.info(`[GRADLE] Classpath of ${contents.length} project(s) resolved in ${((performance.now() - start) / 1000).toFixed(1)}s: ${existing.length} JARs.`);
+            return existing;
+        } catch (error: any) {
+            const details = [error?.stdout, error?.stderr].filter(Boolean).join('\n').split('\n').filter(line => line.trim()).slice(0, 15).join('\n');
+            logger.error(`[GRADLE] Classpath resolution failed: ${error?.message}\n${details}`);
+            throw new Error(`Gradle command failed: ${String(error?.message ?? error).split('\n')[0]}${details ? `\n${details}` : ''}`);
+        } finally {
+            await fs.remove(outputDir).catch(() => {});
+        }
+    }
+
+    /** GRADLE_CMD, then the project's wrapper (gradlew), then GRADLE_HOME/bin/gradle, then gradle on PATH. */
+    private async resolveGradleCommand(projectPath: string): Promise<string> {
+        if (process.env.GRADLE_CMD) {
+            if (/[&|;<>$()]/.test(process.env.GRADLE_CMD)) throw new Error('Invalid GRADLE_CMD: Shell metacharacters are not allowed.');
+            return process.env.GRADLE_CMD;
+        }
+        const wrapper = path.join(projectPath, process.platform === 'win32' ? 'gradlew.bat' : 'gradlew');
+        if (await fs.pathExists(wrapper)) return wrapper;
+        return process.env.GRADLE_HOME ? path.join(process.env.GRADLE_HOME, 'bin', 'gradle') : 'gradle';
     }
 
     /**
@@ -619,6 +697,7 @@ export class DependencyScanner {
      * Cached per project until pom.xml or the resolved classpath changes.
      */
     async listDependencies(projectPath: string): Promise<{ modules: ModuleDependencies[]; cached: boolean }> {
+        if (await buildToolOf(projectPath) === 'gradle') throw new Error('list_dependencies supports Maven only; for this Gradle build run `gradle dependencies`. Classes, sources and the other tools work for Gradle projects.');
         const key = `${await projectCache.getPomHash(projectPath).catch(() => '')}:${projectCache.getClasspathHash((await projectCache.getClasspath(projectPath).catch(() => null)) ?? [])}`;
         const cacheFile = path.join(getProjectCacheDir(projectPath), 'dependency-tree.json');
         const cached = await fs.readJson(cacheFile).catch(() => null);

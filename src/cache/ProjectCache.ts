@@ -181,8 +181,21 @@ export class ProjectCache {
      */
     async getPomHash(projectPath: string): Promise<string> {
         const pomPath = path.join(projectPath, 'pom.xml');
-        const content = await fs.readFile(pomPath, 'utf-8');
-        return createHash('sha256').update(content).digest('hex').substring(0, 16);
+        if (await fs.pathExists(pomPath)) {
+            const content = await fs.readFile(pomPath, 'utf-8');
+            return createHash('sha256').update(content).digest('hex').substring(0, 16);
+        }
+        // Gradle: the root build files and the version catalog decide the resolved classpath.
+        const hash = createHash('sha256');
+        let found = false;
+        for (const name of ['settings.gradle', 'settings.gradle.kts', 'build.gradle', 'build.gradle.kts', 'gradle.properties', path.join('gradle', 'libs.versions.toml')]) {
+            const file = path.join(projectPath, name);
+            if (!(await fs.pathExists(file))) continue;
+            found = true;
+            hash.update(`${name}\n`).update(await fs.readFile(file));
+        }
+        if (!found) throw new Error(`No pom.xml or Gradle build file in ${projectPath}`);
+        return hash.digest('hex').substring(0, 16);
     }
 
     /**

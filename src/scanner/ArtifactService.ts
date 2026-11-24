@@ -749,6 +749,11 @@ export class ArtifactService {
     /** groupId/artifactId/version from a Maven repository layout path (.../g/r/o/u/p/artifact/version/artifact-version.jar). */
     coordinatesFromJarPath(jarPath: string): { groupId?: string; artifactId?: string; version?: string } {
         const parts = path.resolve(jarPath).split(/[\\/]/);
+        // Gradle cache: .../files-2.1/<group>/<artifact>/<version>/<sha1>/<file>.jar
+        const gradleIndex = parts.lastIndexOf('files-2.1');
+        if (gradleIndex >= 0 && parts.length - gradleIndex === 6) {
+            return { groupId: parts[gradleIndex + 1], artifactId: parts[gradleIndex + 2], version: parts[gradleIndex + 3] };
+        }
         const file = parts[parts.length - 1];
         const version = parts[parts.length - 2];
         const artifactId = parts[parts.length - 3];
@@ -830,6 +835,22 @@ export class ArtifactService {
     private artifactIdFromCoordinates(coordinates?: string): string {
         if (!coordinates) return '';
         return coordinates.split(':')[1] || coordinates;
+    }
+
+    /** The -sources.jar of a binary JAR: next to it (Maven repository) or in a sibling hash directory (Gradle cache). */
+    async findSourcesJar(jarPath: string): Promise<string | null> {
+        const sibling = jarPath.replace(/\.jar$/i, '-sources.jar');
+        if (sibling !== jarPath && await fs.pathExists(sibling)) return sibling;
+        const parts = path.resolve(jarPath).split(/[\\/]/);
+        const gradleIndex = parts.lastIndexOf('files-2.1');
+        if (gradleIndex < 0 || parts.length - gradleIndex !== 6) return null;
+        const versionDir = path.dirname(path.dirname(path.resolve(jarPath)));
+        const fileName = path.basename(sibling);
+        for (const hash of await fs.readdir(versionDir).catch(() => [] as string[])) {
+            const candidate = path.join(versionDir, hash, fileName);
+            if (await fs.pathExists(candidate)) return candidate;
+        }
+        return null;
     }
 
     async findCoordinateJars(coordinates: string): Promise<string[]> {

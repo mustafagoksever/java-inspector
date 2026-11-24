@@ -14,7 +14,7 @@ import { DependencyNode, DependencyScanner, ModuleDependencies } from './scanner
 import { DecompilerService } from './decompiler/DecompilerService.js';
 import { artifactService, ArtifactSelector, ClassCandidate } from './scanner/ArtifactService.js';
 import { DeepClassEntry, jarIndexer } from './scanner/JarIndexer.js';
-import { projectDiscovery } from './scanner/ProjectDiscovery.js';
+import { buildToolOf, projectDiscovery } from './scanner/ProjectDiscovery.js';
 import { ClassFileMetadataReader } from './scanner/ClassFileMetadataReader.js';
 import { getResultCacheDir } from './utils/cachePaths.js';
 import { extractMethod, extractTypeDeclaration } from './utils/methodExtractor.js';
@@ -50,28 +50,29 @@ type Progress = (message: string, progress?: number, total?: number) => Promise<
  * Cursor inject this into the model's context, which is what makes the agent pick
  * these tools over shelling out to javap / unzip / jar / find ~/.m2.
  */
-export const SERVER_INSTRUCTIONS = `java-inspector gives read-only access to compiled Java code: Maven dependencies of the workspace, local JAR/WAR/Spring Boot fat JARs, and JDK classes.
+export const SERVER_INSTRUCTIONS = `java-inspector gives read-only access to compiled Java code: Maven/Gradle dependencies of the workspace, local JAR/WAR/Spring Boot fat JARs, and JDK classes.
 
 Prefer these tools over shell commands for anything inside a JAR or the JDK:
 - Instead of \`javap\` / \`javap -c\` / \`javap -p\`: inspect_class with view "api" (signatures) or "bytecode".
 - Instead of decompiling by hand or guessing library behaviour: inspect_class with view "source" (uses -sources.jar when present, otherwise Vineflower). Pass methodName to get a single method; nested classes are addressed as Outer$Inner.
-- For classes from the project's Maven dependencies, pass only className (fully qualified). Do NOT look up the JAR in ~/.m2 or pass jarPath first: the server knows the project classpath and finds the JAR itself, waiting for Maven if the project is opened for the first time.
+- For classes from the project's dependencies, pass only className (fully qualified). Do NOT look up the JAR in ~/.m2 / ~/.gradle or pass jarPath first: the server knows the project classpath and finds the JAR itself, waiting for Maven/Gradle if the project is opened for the first time.
 - Instead of \`unzip -l\`, \`jar tf\`, \`find ~/.m2 -name\`, \`grep -r\` over JARs: search_class, find_jar, inspect_jar, search_resources, read_resource.
 - Before upgrading a library, or for NoSuchMethodError/AbstractMethodError: compare_versions (API diff between two versions).
 - Instead of \`mvn dependency:tree\` or reading pom.xml: list_dependencies (real versions, scope, direct/transitive); explain_dependency for why one artifact is there. For version conflicts / the same class in several JARs (NoSuchMethodError, ClassCastException): find_duplicates.
 - To find who implements an interface or calls/declares a member or uses a string: find_implementations / search_code.
 
-Workflow: inspect_class with the fully qualified name; if you only know the simple name, search_class first. No scan is required first: the Maven classpath is resolved in the background at startup and tools return partial results with complete=false instead of waiting. When a result is ambiguous, the response lists candidates; repeat the call with jarPath set to one of them. All paths must be absolute.`;
+Workflow: inspect_class with the fully qualified name; if you only know the simple name, search_class first. No scan is required first: the classpath is resolved in the background at startup and tools return partial results with complete=false instead of waiting. When a result is ambiguous, the response lists candidates; repeat the call with jarPath set to one of them. All paths must be absolute.`;
 
-const FORMAT = z.enum(['text', 'json', 'toon']).default('text').describe('Response format. "text" is compact and human-readable; "json" returns the full structured result; "toon" is a token-efficient structured encoding.');
-const MODE = z.enum(['fast', 'balanced']).default('balanced').describe('"fast" opens fewer unindexed JARs per call (lower latency, more likely partial); "balanced" opens more.');
+const FORMAT = z.enum(['text', 'json', 'toon']).default('text').describe('"text": compact; "json": full structured result; "toon": compact structured.');
+const MODE = z.enum(['fast', 'balanced']).default('balanced').describe('"fast" opens fewer unindexed JARs per call (quicker, more often partial).');
 const num = (description: string) => z.coerce.number().int().optional().describe(description);
+/** Shared by many tools, so kept short: every word here is repeated in tools/list once per tool. */
 const SELECTOR = {
-    workspacePath: z.string().optional().describe('Absolute path of the Java workspace (directory containing pom.xml, or a parent of several Maven projects). Defaults to the server cwd when no other selector is given.'),
-    jarPath: z.string().optional().describe('Absolute path to one exact JAR. Not needed for Maven dependencies of the workspace (they are resolved from the classpath). Use it for JARs outside the Maven classpath, or to choose one of the candidates a previous response listed.'),
-    jarDirectory: z.string().optional().describe('Absolute directory to search for JARs on demand (for non-Maven projects, e.g. a lib/ folder).'),
-    jarNamePrefix: z.string().optional().describe('Restrict to JARs whose file name starts with this, e.g. "spring-web" or "jackson-databind-2.17".'),
-    coordinates: z.string().optional().describe('Maven coordinates groupId:artifactId[:version[:classifier]] resolved from the local repository, e.g. "com.fasterxml.jackson.core:jackson-databind".'),
+    workspacePath: z.string().optional().describe('Absolute project directory (pom.xml or Gradle build, or a parent of several). Default: server cwd.'),
+    jarPath: z.string().optional().describe('Absolute path of one JAR. Not needed for project dependencies; use it for other JARs or to pick a listed candidate.'),
+    jarDirectory: z.string().optional().describe('Absolute directory of JARs to search (projects without Maven/Gradle, e.g. lib/).'),
+    jarNamePrefix: z.string().optional().describe('Only JARs whose file name starts with this, e.g. "jackson-databind".'),
+    coordinates: z.string().optional().describe('groupId:artifactId[:version[:classifier]] from the local Maven repository.'),
 };
 const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
 
@@ -114,11 +115,11 @@ export class JavaClassAnalyzerMCPServer {
             });
         };
 
-        register('scan_project', 'Scan Maven dependencies',
-            'Start, refresh, or poll the background index of a Maven workspace\'s dependency JARs. Returns immediately. ' +
-            'Usually NOT needed: the server auto-scans the top-level pom.xml files under its cwd at startup and every other tool works on a partial index. ' +
-            'Call it to index a different workspace, to check progress, or with forceRefresh=true after pom.xml changes.',
-            { workspacePath: z.string().describe('Absolute workspace path containing pom.xml (or parent of several Maven projects).'), forceRefresh: z.boolean().default(false).describe('Drop the cached classpath/index and re-run Maven.'), format: FORMAT },
+        register('scan_project', 'Scan dependencies',
+            'Start, refresh, or poll the background index of a workspace\'s dependency JARs (Maven or Gradle). Returns immediately. ' +
+            'Usually NOT needed: the server auto-scans the top-level Maven/Gradle builds under its cwd at startup and every other tool works on a partial index. ' +
+            'Call it to index a different workspace, to check progress, or with forceRefresh=true after build files change.',
+            { workspacePath: z.string().describe('Absolute project directory (pom.xml or Gradle build, or a parent of several).'), forceRefresh: z.boolean().default(false).describe('Drop the cached classpath/index and resolve it again.'), format: FORMAT },
             (args, progress) => this.handleScanProject(args, progress));
 
         register('find_jar', 'Find JAR',
@@ -134,7 +135,7 @@ export class JavaClassAnalyzerMCPServer {
             args => this.handleInspectJar(args));
 
         register('search_class', 'Search classes',
-            'Find classes by simple name, fully qualified name, or partial name (e.g. "ObjectMapper", "jackson ObjectMapper", "web.client.RestTemplate") across the workspace\'s Maven dependencies, a JAR directory, or one JAR. ' +
+            'Find classes by simple name, fully qualified name, or partial name (e.g. "ObjectMapper", "jackson ObjectMapper", "web.client.RestTemplate") across the workspace\'s dependencies, a JAR directory, or one JAR. ' +
             'First step before inspect_class when the package is unknown. Uses the live (possibly still-building) index and opens unindexed JARs on demand; complete=false means more JARs remain, so call again or narrow with jarNamePrefix. ' +
             'Use instead of `unzip -l *.jar | grep` or `find ~/.m2`.',
             { query: z.string().describe('Class name or fragment. Space/dot separated parts must all appear in the fully qualified name.'), ...SELECTOR, includeJdk: z.boolean().default(false).describe('Also search JDK classes (java.*, javax.*, jdk.*).'), mode: MODE, limit: num('Max results (1-100, default 20).'), format: FORMAT },
@@ -154,7 +155,7 @@ export class JavaClassAnalyzerMCPServer {
             (args, progress) => this.handleFindImplementations(args, progress));
 
         register('find_duplicates', 'Find duplicate classes',
-            'List classes that exist in more than one JAR of the Maven classpath: the same artifact in two versions, split packages, or shaded/relocated copies (typical causes of NoSuchMethodError, ClassCastException, "works in IDE, fails in prod"). ' +
+            'List classes that exist in more than one JAR of the classpath: the same artifact in two versions, split packages, or shaded/relocated copies (typical causes of NoSuchMethodError, ClassCastException, "works in IDE, fails in prod"). ' +
             'Groups duplicates by the set of JARs that share them, with Maven coordinates, class counts and sample classes. Use instead of comparing `jar tf` listings by hand; then explain_dependency tells why each JAR is on the classpath. ' +
             'complete=false means some JARs were not indexed yet; call again.',
             {
@@ -168,21 +169,21 @@ export class JavaClassAnalyzerMCPServer {
             (args, progress) => this.handleFindDuplicates(args, progress));
 
         register('inspect_class', 'Inspect / decompile class',
-            'Read a Java class from a Maven dependency, local JAR, or the JDK. Use instead of javap, unzip or a decompiler in the shell. ' +
+            'Read a Java class from a project dependency, local JAR, or the JDK. Use instead of javap, unzip or a decompiler in the shell. ' +
             'view="source": real source from a -sources.jar if present, otherwise decompiled with Vineflower; files over 400 lines return the first lines plus an outline. view="outline": members with line ranges (cheapest way to see a large class). ' +
             'view="api": compact member signatures (replaces `javap -p`). view="bytecode": `javap -c` (per method with methodName). view="hierarchy": superclass chain and interfaces. view="all": everything. ' +
-            'Efficient pattern: outline (or api) first, then methodName for the code you need. For a stack trace, pass line. For Maven dependencies pass ONLY className: the JAR comes from the project classpath (do not locate it in ~/.m2). Use search_class first if you only know part of the name.',
+            'Efficient pattern: outline (or api) first, then methodName for the code you need. For a stack trace, pass line. For project dependencies pass ONLY className: the JAR comes from the classpath (do not locate it in ~/.m2). Use search_class first if you only know part of the name.',
             {
                 className: z.string().describe('Fully qualified class name, e.g. "com.fasterxml.jackson.databind.ObjectMapper". Nested classes: "com.acme.Outer$Inner" (or "com.acme.Outer.Inner"); view=source then returns just the nested declaration.'),
                 ...SELECTOR,
                 view: z.enum(['source', 'outline', 'api', 'hierarchy', 'bytecode', 'all']).default('source').describe('Which view to return.'),
                 methodName: z.string().optional().describe('source/bytecode: return just this method or constructor (all overloads unless paramTypes is given). If the class does not declare it, superclasses and interfaces are searched.'),
                 paramTypes: z.array(z.string()).optional().describe('Simple or qualified parameter type names to select one overload, e.g. ["String", "int"].'),
-                line: num('Original source line number, e.g. 123 from "at com.acme.Foo.bar(Foo.java:123)": returns the method containing that line (marked when real sources exist; for decompiled code the method is located via the class file line table).'),
+                line: num('Source line from a stack trace, e.g. 123 from "at com.acme.Foo.bar(Foo.java:123)": returns the method containing it (also for decompiled code, via the line table).'),
                 offset: num('view=source: 1-based first line to return (default 1).'),
                 limit: num(`view=source: number of lines to return. Default: whole file up to ${SOURCE_AUTO_LIMIT} lines; larger files return the first ${SOURCE_AUTO_PREVIEW} lines plus an outline.`),
                 useCache: z.boolean().default(true).describe('Reuse cached decompiled source.'),
-                downloadSources: z.boolean().optional().describe('If no -sources.jar is in ~/.m2, download it with `mvn dependency:get` (network) before decompiling. Default: env JAVA_INSPECTOR_DOWNLOAD_SOURCES, else false.'),
+                downloadSources: z.boolean().optional().describe('Maven: download a missing -sources.jar (`mvn dependency:get`, network) instead of decompiling. Default: env JAVA_INSPECTOR_DOWNLOAD_SOURCES.'),
                 format: FORMAT,
             },
             (args, progress) => this.handleInspectClass(args, progress));
@@ -252,7 +253,7 @@ export class JavaClassAnalyzerMCPServer {
         }
         const complete = projects.every(project => project.status === 'complete');
         const structured = { workspacePath, status: complete ? 'complete' : 'in_progress', pomRoots, projects };
-        const text = complete ? `Maven scan complete for ${pomRoots.length} top-level project(s).` : `Maven auto-scan is running for ${pomRoots.length} top-level project(s). Tools can be used immediately.`;
+        const text = complete ? `Scan complete for ${pomRoots.length} top-level project(s).` : `Auto-scan is running for ${pomRoots.length} top-level project(s). Tools can be used immediately.`;
         return this.formatResponse(text, structured, args.format);
     }
 
@@ -508,7 +509,7 @@ export class JavaClassAnalyzerMCPServer {
     private async handleListDependencies(args: any, sendProgress?: Progress) {
         const workspacePath = await this.validateWorkspacePath(args.workspacePath ?? process.cwd());
         const contexts = await projectDiscovery.findTopLevelPomDirectories(workspacePath);
-        if (!contexts.length) throw new Error(`No pom.xml found under ${workspacePath}; list_dependencies needs a Maven project.`);
+        if (!contexts.length) throw new Error(`No Maven/Gradle build found under ${workspacePath}; list_dependencies needs a Maven project.`);
         const query = typeof args.query === 'string' ? args.query.toLowerCase() : '';
         const limit = this.clamp(args.limit, 1, 2000, 300);
         const projects: Array<{ projectPath: string; modules?: Array<ModuleDependencies & { directCount: number; transitiveCount: number }>; error?: string }> = [];
@@ -567,7 +568,7 @@ export class JavaClassAnalyzerMCPServer {
         }
         if (!coordinates) throw new Error('coordinates or a JAR containing Maven pom.properties is required');
         const contexts = await projectDiscovery.findTopLevelPomDirectories(workspacePath);
-        if (!contexts.length) throw new Error(`No pom.xml found under ${workspacePath}; explain_dependency needs a Maven project.`);
+        if (!contexts.length) throw new Error(`No Maven/Gradle build found under ${workspacePath}; explain_dependency needs a Maven project.`);
         const outputs: Array<{ projectPath: string; output?: string; error?: string }> = [];
         for (let i = 0; i < contexts.length; i++) {
             try { outputs.push({ projectPath: contexts[i], output: await this.scanner.explainDependency(contexts[i], coordinates) }); }
@@ -786,14 +787,15 @@ export class JavaClassAnalyzerMCPServer {
         if (embeddedSource) {
             return { source: (await jarIndexer.readEntry(candidate.jarPath, embeddedSource.entryPath, 10 * 1024 * 1024)).toString('utf8'), sourceOrigin: 'embedded-source' };
         }
-        const sourceJar = candidate.jarPath.replace(/\.jar$/i, '-sources.jar');
-        if (sourceJar !== candidate.jarPath && await fs.pathExists(sourceJar)) {
+        let sourceJar = await artifactService.findSourcesJar(candidate.jarPath);
+        if (sourceJar) {
             const sourceIndex = await jarIndexer.getLightIndex(sourceJar, contextPath);
             const sourceEntry = sourceIndex.classes.find(item => item.className === candidate.className && item.isSource);
             if (sourceEntry) return { source: (await jarIndexer.readEntry(sourceJar, sourceEntry.entryPath, 10 * 1024 * 1024)).toString('utf8'), sourceOrigin: 'sources-jar' };
         }
         const downloadNote = await this.tryDownloadSources(candidate, contextPath, args);
-        if (downloadNote === true) {
+        if (downloadNote === true) sourceJar = await artifactService.findSourcesJar(candidate.jarPath);
+        if (downloadNote === true && sourceJar) {
             const sourceIndex = await jarIndexer.getLightIndex(sourceJar, contextPath);
             const sourceEntry = sourceIndex.classes.find(item => item.className === candidate.className && item.isSource);
             if (sourceEntry) return { source: (await jarIndexer.readEntry(sourceJar, sourceEntry.entryPath, 10 * 1024 * 1024)).toString('utf8'), sourceOrigin: 'sources-jar', sourceNote: 'Sources JAR downloaded with mvn dependency:get.' };
@@ -812,6 +814,7 @@ export class JavaClassAnalyzerMCPServer {
         if (!requested) return undefined;
         const coordinates = artifactService.coordinatesFromJarPath(candidate.jarPath);
         if (!coordinates.groupId || !coordinates.artifactId || !coordinates.version) return 'downloadSources skipped: the JAR is not in a Maven repository layout.';
+        if (await buildToolOf(contextPath) === 'gradle') return 'downloadSources needs Maven; for Gradle projects add the sources to the Gradle cache (e.g. the IDE "Download Sources" action).';
         const key = `${coordinates.groupId}:${coordinates.artifactId}:${coordinates.version}`;
         let attempt = this.sourceDownloads.get(key);
         if (!attempt) {
@@ -819,8 +822,7 @@ export class JavaClassAnalyzerMCPServer {
             this.sourceDownloads.set(key, attempt);
         }
         const result = await attempt;
-        const sourceJar = candidate.jarPath.replace(/\.jar$/i, '-sources.jar');
-        if (result.ok && await fs.pathExists(sourceJar)) return true;
+        if (result.ok && await artifactService.findSourcesJar(candidate.jarPath)) return true;
         return `No sources JAR could be downloaded for ${key}${result.message ? ` (${result.message})` : ''}; showing decompiled code.`;
     }
 

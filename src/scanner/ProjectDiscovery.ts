@@ -13,10 +13,22 @@ const MAX_DEPTH = 4;
 const MAX_DIRECTORIES = 5_000;
 const CACHE_TTL_MS = 30_000;
 
+const GRADLE_ROOT_FILES = ['settings.gradle', 'settings.gradle.kts', 'build.gradle', 'build.gradle.kts'];
+
+/** 'maven' when the directory has a pom.xml (preferred), 'gradle' for a Gradle build, otherwise null. */
+export async function buildToolOf(directory: string): Promise<'maven' | 'gradle' | null> {
+    if (await fs.pathExists(path.join(directory, 'pom.xml'))) return 'maven';
+    for (const name of GRADLE_ROOT_FILES) if (await fs.pathExists(path.join(directory, name))) return 'gradle';
+    return null;
+}
+
 export class ProjectDiscovery {
     private cache = new Map<string, { at: number; result: Promise<string[]> }>();
 
-    /** Find every pom.xml at the first depth (<= MAX_DEPTH) containing a POM. Results are cached briefly. */
+    /**
+     * Find the top-level build roots: directories with a pom.xml or a Gradle settings/build file, at the first
+     * depth (<= MAX_DEPTH) that has any. Results are cached briefly.
+     */
     async findTopLevelPomDirectories(workspacePath: string): Promise<string[]> {
         const key = path.resolve(workspacePath);
         const cached = this.cache.get(key);
@@ -32,7 +44,7 @@ export class ProjectDiscovery {
         const stat = await fs.stat(root).catch(() => null);
         if (!stat?.isDirectory()) throw new Error(`workspacePath is not a directory: ${root}`);
 
-        if (await fs.pathExists(path.join(root, 'pom.xml'))) return [root];
+        if (await buildToolOf(root)) return [root];
 
         let level = [root];
         const visited = new Set<string>([root]);
@@ -54,7 +66,7 @@ export class ProjectDiscovery {
                     const child = path.join(directory, entry.name);
                     if (visited.has(child)) continue;
                     visited.add(child);
-                    if (await fs.pathExists(path.join(child, 'pom.xml'))) matches.push(child);
+                    if (await buildToolOf(child)) matches.push(child);
                     else next.push(child);
                 }
             }

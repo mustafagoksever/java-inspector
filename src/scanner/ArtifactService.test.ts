@@ -243,3 +243,23 @@ describe('ArtifactService', () => {
         }
     });
 });
+
+describe('ArtifactService Gradle cache layout', () => {
+    it('reads coordinates and finds the sources JAR in a sibling hash directory', async () => {
+        const service = new ArtifactService();
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ji-gradle-cache-'));
+        try {
+            const versionDir = path.join(root, 'caches', 'modules-2', 'files-2.1', 'org.apache.commons', 'commons-lang3', '3.14.0');
+            fs.mkdirSync(path.join(versionDir, 'aaa'), { recursive: true });
+            fs.mkdirSync(path.join(versionDir, 'bbb'), { recursive: true });
+            const jar = path.join(versionDir, 'aaa', 'commons-lang3-3.14.0.jar');
+            fs.writeFileSync(jar, '');
+            expect(service.coordinatesFromJarPath(jar)).toEqual({ groupId: 'org.apache.commons', artifactId: 'commons-lang3', version: '3.14.0' });
+            expect(await service.findSourcesJar(jar)).toBeNull();
+            fs.writeFileSync(path.join(versionDir, 'bbb', 'commons-lang3-3.14.0-sources.jar'), '');
+            expect(await service.findSourcesJar(jar)).toBe(path.join(versionDir, 'bbb', 'commons-lang3-3.14.0-sources.jar'));
+        } finally {
+            fs.rmSync(root, { recursive: true, force: true });
+        }
+    });
+});
