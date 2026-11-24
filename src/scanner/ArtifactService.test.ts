@@ -8,11 +8,15 @@ import { projectCache } from '../cache/ProjectCache.js';
 
 describe('ArtifactService', () => {
     const service = new ArtifactService();
-    const libDirectory = path.resolve('lib');
+    // Private copy of the bundled JAR: the cache directory is keyed by the JAR's folder, and
+    // invalidating the shared lib/ cache would delete temp files of suites running in parallel.
+    const libDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'java-inspector-artifact-lib-'));
     const jarPath = path.join(libDirectory, 'vineflower-1.12.0.jar');
+    fs.copyFileSync(path.resolve('lib', 'vineflower-1.12.0.jar'), jarPath);
 
     afterAll(async () => {
         await projectCache.invalidate(libDirectory).catch(() => {});
+        fs.rmSync(libDirectory, { recursive: true, force: true });
     });
 
     it('finds a local JAR by prefix without requiring Maven', async () => {

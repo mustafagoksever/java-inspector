@@ -102,7 +102,7 @@ describe('JavaClassAnalyzerMCPServer', () => {
         it('inspects nested classes by binary or source-style name', async () => {
             const jarPath = path.resolve('lib', 'vineflower-1.12.0.jar');
             const binary = await callTool('inspect_class', { className: 'org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler$SaveType', jarPath, view: 'all' });
-            expect(binary.isError).toBeFalsy();
+            expect(binary.isError ? binary.content[0].text : '').toBe('');
             const text = binary.content[0].text;
             expect(text).toMatch(/Enclosing class: org\.jetbrains\.java\.decompiler\.main\.decompiler\.ConsoleDecompiler/);
             expect(text).toMatch(/enum SaveType/);
