@@ -110,7 +110,7 @@ Cache lives under the **user home** (`~/.cache/java-inspector/...`), not in the 
 |---------|-----------|
 | Module `pom.xml` changes | `pomHash` mismatch in `isIndexComplete()` |
 | Parent POM / dependency management changes | `classpathHash` mismatch in `isIndexComplete()` |
-| Manual force refresh | `scan_dependencies` with `forceRefresh: true` |
+| Manual force refresh | `scan_project` with `forceRefresh: true` |
 
 `isIndexComplete()` checks **both** `pomHash` and `classpathHash`. If either changed, returns `false`, triggering a fresh scan.
 
