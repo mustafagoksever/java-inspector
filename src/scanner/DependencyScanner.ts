@@ -103,29 +103,6 @@ export class DependencyScanner {
             }
         }
 
-        // Cross-process check: is another process currently scanning?
-        const isLockedByOther = await CrossProcessLock.check(projectPath, 'scan');
-        if (isLockedByOther) {
-            logger.info('[SCAN] Another process is currently scanning this project.');
-            const progress = await projectCache.getScanProgress(projectPath) ?? undefined;
-            const progressText = progress
-                ? `${progress.processed}/${progress.total} JARs processed`
-                : 'scanning in progress';
-            await onProgress?.(
-                `Another process is scanning: ${progressText}`,
-                progress ? Math.floor((progress.processed / progress.total) * 100) : 0,
-                100
-            );
-            return {
-                jarCount: progress?.total ?? 0,
-                classCount: 0,
-                sampleEntries: [],
-                status: 'in_progress',
-                progress,
-                message: 'Another process is currently scanning this project. Please wait or call again later.',
-            };
-        }
-
         // Check if classpath resolution is already in progress (in-process)
         if (this.classpathPromises.has(projectPath)) {
             await onProgress?.('Maven classpath resolution in progress...', 5, 100);
@@ -153,6 +130,29 @@ export class DependencyScanner {
                 sampleEntries: [],
                 status: 'in_progress',
                 progress,
+            };
+        }
+
+        // Cross-process check: is another process currently scanning?
+        const isLockedByOther = await CrossProcessLock.check(projectPath, 'scan');
+        if (isLockedByOther) {
+            logger.info('[SCAN] Another process is currently scanning this project.');
+            const progress = await projectCache.getScanProgress(projectPath) ?? undefined;
+            const progressText = progress
+                ? `${progress.processed}/${progress.total} JARs processed`
+                : 'scanning in progress';
+            await onProgress?.(
+                `Another process is scanning: ${progressText}`,
+                progress ? Math.floor((progress.processed / progress.total) * 100) : 0,
+                100
+            );
+            return {
+                jarCount: progress?.total ?? 0,
+                classCount: 0,
+                sampleEntries: [],
+                status: 'in_progress',
+                progress,
+                message: 'Another process is currently scanning this project. Please wait or call again later.',
             };
         }
 

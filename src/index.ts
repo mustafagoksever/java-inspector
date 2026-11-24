@@ -233,7 +233,7 @@ export class JavaClassAnalyzerMCPServer {
         if (!args.query || !args.kind) throw new Error('query and kind are required');
         const selector = await this.selectorFromArgs(args, true);
         await sendProgress?.(`Searching deep metadata for ${args.kind}: ${args.query}`, 0, 100);
-        const result = await artifactService.searchCode(args.query, args.kind, selector, this.clamp(args.limit, 1, 100, 20), args.mode === 'fast' ? 2 : 5);
+        const result = await artifactService.searchCode(args.query, args.kind, selector, this.clamp(args.limit, 1, 100, 20), args.mode === 'fast' ? 3 : 10);
         let text = result.matches.length ? `Found ${result.matches.length} match(es):\n${result.matches.map(item => `- ${item.className}${item.member ? `#${item.member}` : ''} -> ${item.jarPath}`).join('\n')}` : `No ${args.kind} match found for "${args.query}".`;
         if (!result.complete) text += `\n\nSearch is partial; ${result.remainingJarCount} JAR(s) remain.`;
         if (result.errors.length) text += `\n${result.errors.map(error => `- ${error.jarPath ?? error.contextPath ?? 'workspace'}: ${error.message}`).join('\n')}`;
@@ -244,7 +244,7 @@ export class JavaClassAnalyzerMCPServer {
         this.validateClassName(args.className);
         const selector = await this.selectorFromArgs(args, true);
         await sendProgress?.(`Finding implementations of ${args.className}`, 0, 100);
-        const result = await artifactService.findImplementations(args.className, selector, args.transitive !== false, this.clamp(args.limit, 1, 200, 50), args.mode === 'fast' ? 2 : 5);
+        const result = await artifactService.findImplementations(args.className, selector, args.transitive !== false, this.clamp(args.limit, 1, 200, 50), args.mode === 'fast' ? 3 : 10);
         let text = result.implementations.length ? `Found ${result.implementations.length} implementation(s):\n${result.implementations.map(item => `- ${item.className} -> ${item.jarPath}`).join('\n')}` : `No implementations found for ${args.className}${result.complete ? '.' : ' in the currently deep-indexed JARs.'}`;
         if (!result.complete && result.remainingJarCount > 0) text += `\n\nSearch is partial; ${result.remainingJarCount} JAR(s) not deep-indexed yet. Call again to continue, or narrow with jarNamePrefix.`;
         if (result.errors.length) text += `\n${result.errors.map(error => `- ${error.jarPath ?? error.contextPath ?? 'workspace'}: ${error.message}`).join('\n')}`;
@@ -328,6 +328,7 @@ export class JavaClassAnalyzerMCPServer {
         }
         if (!coordinates) throw new Error('coordinates or a JAR containing Maven pom.properties is required');
         const contexts = await projectDiscovery.findTopLevelPomDirectories(workspacePath);
+        if (!contexts.length) throw new Error(`No pom.xml found under ${workspacePath}; explain_dependency needs a Maven project.`);
         const outputs: Array<{ projectPath: string; output?: string; error?: string }> = [];
         for (let i = 0; i < contexts.length; i++) {
             try { outputs.push({ projectPath: contexts[i], output: await this.scanner.explainDependency(contexts[i], coordinates) }); }
