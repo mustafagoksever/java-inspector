@@ -472,6 +472,31 @@ export class DependencyScanner {
         return [stdout, stderr].filter(value => value?.trim()).join('\n');
     }
 
+    /**
+     * Download the -sources.jar of one artifact into the local repository (`mvn dependency:get`).
+     * Opt-in: it reaches the network. Returns Maven's error output on failure.
+     */
+    async downloadSources(projectPath: string, coordinates: { groupId: string; artifactId: string; version: string }): Promise<{ ok: boolean; message?: string }> {
+        const gav = `${coordinates.groupId}:${coordinates.artifactId}:${coordinates.version}`;
+        if (!/^[\w.\-]+:[\w.\-]+:[\w.\-+]+$/.test(gav)) return { ok: false, message: `Invalid coordinates: ${gav}` };
+        const mavenCmd = await this.resolveMavenCommand(projectPath);
+        const logger = Logger.get(projectPath);
+        logger.info(`[MAVEN] Downloading sources for ${gav}`);
+        try {
+            await execFileAsync(mavenCmd, ['-B', '-q', 'dependency:get', `-Dartifact=${gav}:jar:sources`, '-Dtransitive=false'], {
+                cwd: projectPath,
+                timeout: 120000,
+                shell: process.platform === 'win32',
+                maxBuffer: 10 * 1024 * 1024,
+            });
+            return { ok: true };
+        } catch (error: any) {
+            const output = `${error?.stdout ?? ''}\n${error?.stderr ?? ''}`.split('\n').filter(line => /ERROR|Could not/.test(line)).slice(0, 3).join(' ').trim();
+            logger.info(`[MAVEN] Sources download failed for ${gav}: ${output || error?.message}`);
+            return { ok: false, message: output || String(error?.message ?? error) };
+        }
+    }
+
     private async withClasspathResolutionSlot<T>(task: () => Promise<T>): Promise<T> {
         if (this.activeClasspathResolutions >= 2) {
             await new Promise<void>(resolve => this.classpathResolutionQueue.push(resolve));

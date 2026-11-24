@@ -1,4 +1,4 @@
-import { buildOutline, extractMembers, formatOutline, javapMemberAtLine, memberAtLine, parseJavapMembers, selectJavapMembers } from './javaOutline.js';
+import { buildOutline, cleanDecompilerFailures, extractMembers, formatOutline, javapMemberAtLine, memberAtLine, parseJavapMembers, selectJavapMembers } from './javaOutline.js';
 
 const SOURCE = [
     'package demo;',                                                        // 1
@@ -156,5 +156,35 @@ describe('parseJavapMembers', () => {
         expect(selectJavapMembers(parsed.members, 'Demo', undefined, 'demo.Demo')).toHaveLength(1);
         expect(javapMemberAtLine(parsed.members, 22)?.signature).toBe('public static boolean isBlank(java.lang.CharSequence);');
         expect(javapMemberAtLine(parsed.members, 99)).toBeUndefined();
+    });
+});
+
+describe('cleanDecompilerFailures', () => {
+    it('replaces the Vineflower stack trace with one line and reports the method', () => {
+        const source = [
+            'public class P {',
+            '    static double area(Object s) {',
+            "        // $VF: Couldn't be decompiled",
+            '        // Please report this to the Vineflower issue tracker, at https://github.com/Vineflower/vineflower/issues with a copy of the class file (if you have the rights to distribute it!)',
+            '        // java.lang.IllegalStateException: Invalid switch case set',
+            '        //   at org.jetbrains.java.decompiler.Foo.bar(Foo.java:10)',
+            '        //   at org.jetbrains.java.decompiler.Foo.baz(Foo.java:20)',
+            '        //',
+            '        // Bytecode:',
+            '        // 00: aload 0',
+            '    }',
+            '}',
+        ].join('\n');
+        const result = cleanDecompilerFailures(source);
+        expect(result.failedMethods).toEqual(['static double area(Object s)']);
+        expect(result.source).not.toContain('Please report');
+        expect(result.source).not.toContain('org.jetbrains');
+        expect(result.source).toContain("$VF: Couldn't be decompiled (IllegalStateException: Invalid switch case set)");
+        expect(result.source).toContain('// Bytecode:');
+        expect(result.source).toContain('// 00: aload 0');
+    });
+
+    it('leaves clean sources untouched', () => {
+        expect(cleanDecompilerFailures('class A {}')).toEqual({ source: 'class A {}', failedMethods: [] });
     });
 });

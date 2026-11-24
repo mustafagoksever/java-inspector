@@ -363,3 +363,34 @@ export function javapMemberAtLine(members: JavapMember[], line: number): JavapMe
         .filter(member => member.lines.length > 0 && Math.min(...member.lines) <= line && Math.max(...member.lines) >= line)
         .sort((a, b) => (Math.max(...a.lines) - Math.min(...a.lines)) - (Math.max(...b.lines) - Math.min(...b.lines)))[0];
 }
+
+/**
+ * Vineflower writes "$VF: Couldn't be decompiled" plus the decompiler's own Java stack trace into the
+ * method body. Keep its bytecode listing (useful) but replace the trace with one line, and report
+ * which methods failed so the response can point to view=bytecode.
+ */
+export function cleanDecompilerFailures(source: string): { source: string; failedMethods: string[] } {
+    if (!source.includes("$VF: Couldn't be decompiled")) return { source, failedMethods: [] };
+    const lines = source.split('\n');
+    const output: string[] = [];
+    const failedMethods: string[] = [];
+    for (let index = 0; index < lines.length; index++) {
+        const line = lines[index];
+        const marker = line.match(/^(\s*)\/\/ \$VF: Couldn't be decompiled/);
+        if (!marker) { output.push(line); continue; }
+        const signature = [...output].reverse().find(previous => previous.trim() && !previous.trim().startsWith('//'))?.trim().replace(/\s*\{$/, '') ?? 'unknown method';
+        failedMethods.push(signature);
+        let reason = '';
+        let next = index + 1;
+        while (next < lines.length) {
+            const text = lines[next].trim();
+            if (/^\/\/ Please report/.test(text) || /^\/\/\s+at /.test(text) || text === '//' || /^\/\/\s+\.\.\. \d+ more/.test(text)) { next++; continue; }
+            const exception = text.match(/^\/\/ ((?:[\w$]+\.)+[\w$]*(?:Exception|Error)(?::.*)?)$/);
+            if (exception && !reason) { reason = exception[1].replace(/^(?:[a-z]\w*\.)+/, ''); next++; continue; }
+            break;
+        }
+        output.push(`${marker[1]}// $VF: Couldn't be decompiled${reason ? ` (${reason})` : ''}. Vineflower's bytecode listing follows; inspect_class view=bytecode with methodName gives javap output.`);
+        index = next - 1;
+    }
+    return { source: output.join('\n'), failedMethods };
+}

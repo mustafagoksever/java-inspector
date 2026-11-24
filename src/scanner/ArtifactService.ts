@@ -747,7 +747,7 @@ export class ArtifactService {
     }
 
     /** groupId/artifactId/version from a Maven repository layout path (.../g/r/o/u/p/artifact/version/artifact-version.jar). */
-    private coordinatesFromJarPath(jarPath: string): { groupId?: string; artifactId?: string; version?: string } {
+    coordinatesFromJarPath(jarPath: string): { groupId?: string; artifactId?: string; version?: string } {
         const parts = path.resolve(jarPath).split(/[\\/]/);
         const file = parts[parts.length - 1];
         const version = parts[parts.length - 2];

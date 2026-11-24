@@ -17,7 +17,7 @@ import { projectDiscovery } from './scanner/ProjectDiscovery.js';
 import { ClassFileMetadataReader } from './scanner/ClassFileMetadataReader.js';
 import { getResultCacheDir } from './utils/cachePaths.js';
 import { extractMethod, extractTypeDeclaration } from './utils/methodExtractor.js';
-import { buildOutline, extractMembers, formatOutline, JavapMember, javapMemberAtLine, memberAtLine, memberRangeWithDoc, OutlineMember, parseJavapMembers, selectJavapMembers } from './utils/javaOutline.js';
+import { buildOutline, cleanDecompilerFailures, extractMembers, formatOutline, JavapMember, javapMemberAtLine, memberAtLine, memberRangeWithDoc, OutlineMember, parseJavapMembers, selectJavapMembers } from './utils/javaOutline.js';
 import { Logger } from './utils/Logger.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -77,6 +77,7 @@ export class JavaClassAnalyzerMCPServer {
     private mcp: McpServer;
     private analyzer = new JavaClassAnalyzer();
     private scanner = new DependencyScanner();
+    private sourceDownloads = new Map<string, Promise<{ ok: boolean; message?: string }>>();
     private decompiler = new DecompilerService();
 
     /** Low-level protocol server (kept for tests and advanced use). */
@@ -179,6 +180,7 @@ export class JavaClassAnalyzerMCPServer {
                 offset: num('view=source: 1-based first line to return (default 1).'),
                 limit: num(`view=source: number of lines to return. Default: whole file up to ${SOURCE_AUTO_LIMIT} lines; larger files return the first ${SOURCE_AUTO_PREVIEW} lines plus an outline.`),
                 useCache: z.boolean().default(true).describe('Reuse cached decompiled source.'),
+                downloadSources: z.boolean().optional().describe('If no -sources.jar is in ~/.m2, download it with `mvn dependency:get` (network) before decompiling. Default: env JAVA_INSPECTOR_DOWNLOAD_SOURCES, else false.'),
                 format: FORMAT,
             },
             (args, progress) => this.handleInspectClass(args, progress));
@@ -447,13 +449,13 @@ export class JavaClassAnalyzerMCPServer {
         const outerEntryPath = entryPath.replace(/\$[^/]*(\.class|\.java)$/i, '$1');
         const raw = await this.loadRawSource({ ...candidate, className: outerClassName }, outerEntryPath, contextPath, args);
         const nested = extractTypeDeclaration(raw.source, candidate.className.substring(dollar + 1).split('$'));
-        if (nested) return { source: nested, sourceOrigin: raw.sourceOrigin, enclosingClass: outerClassName, rawSource: raw.source };
+        if (nested) return { source: nested, sourceOrigin: raw.sourceOrigin, enclosingClass: outerClassName, rawSource: raw.source, ...(raw.sourceNote ? { sourceNote: raw.sourceNote } : {}) };
         return {
             source: raw.source,
             rawSource: raw.source,
             sourceOrigin: raw.sourceOrigin,
             enclosingClass: outerClassName,
-            sourceNote: `${candidate.className} is an anonymous/local or synthetic class; showing the source of ${outerClassName}. Use view=bytecode for its exact code.`,
+            sourceNote: [`${candidate.className} is an anonymous/local or synthetic class; showing the source of ${outerClassName}. Use view=bytecode for its exact code.`, raw.sourceNote].filter(Boolean).join(' '),
         };
     }
 
@@ -623,7 +625,7 @@ export class JavaClassAnalyzerMCPServer {
         };
     }
 
-    private async loadRawSource(candidate: ClassCandidate, entryPath: string, contextPath: string, args: any): Promise<{ source: string; sourceOrigin: NonNullable<SourceSlice['sourceOrigin']> }> {
+    private async loadRawSource(candidate: ClassCandidate, entryPath: string, contextPath: string, args: any): Promise<{ source: string; sourceOrigin: NonNullable<SourceSlice['sourceOrigin']>; sourceNote?: string }> {
         const sameJarIndex = await jarIndexer.getLightIndex(candidate.jarPath, contextPath);
         const embeddedSource = sameJarIndex.classes.find(item => item.className === candidate.className && item.isSource);
         if (embeddedSource) {
@@ -635,8 +637,36 @@ export class JavaClassAnalyzerMCPServer {
             const sourceEntry = sourceIndex.classes.find(item => item.className === candidate.className && item.isSource);
             if (sourceEntry) return { source: (await jarIndexer.readEntry(sourceJar, sourceEntry.entryPath, 10 * 1024 * 1024)).toString('utf8'), sourceOrigin: 'sources-jar' };
         }
-        const source = await this.decompiler.decompileClassFromJar(candidate.className, candidate.jarPath, contextPath, entryPath, args.useCache !== false);
-        return { source, sourceOrigin: 'decompiled' };
+        const downloadNote = await this.tryDownloadSources(candidate, contextPath, args);
+        if (downloadNote === true) {
+            const sourceIndex = await jarIndexer.getLightIndex(sourceJar, contextPath);
+            const sourceEntry = sourceIndex.classes.find(item => item.className === candidate.className && item.isSource);
+            if (sourceEntry) return { source: (await jarIndexer.readEntry(sourceJar, sourceEntry.entryPath, 10 * 1024 * 1024)).toString('utf8'), sourceOrigin: 'sources-jar', sourceNote: 'Sources JAR downloaded with mvn dependency:get.' };
+        }
+        const decompiled = cleanDecompilerFailures(await this.decompiler.decompileClassFromJar(candidate.className, candidate.jarPath, contextPath, entryPath, args.useCache !== false));
+        return {
+            source: decompiled.source,
+            sourceOrigin: 'decompiled',
+            ...(typeof downloadNote === 'string' || decompiled.failedMethods.length ? { sourceNote: [typeof downloadNote === 'string' ? downloadNote : '', decompiled.failedMethods.length ? `Vineflower could not decompile ${decompiled.failedMethods.length} method(s): ${decompiled.failedMethods.join('; ')}. Their bodies contain a bytecode listing; use view=bytecode with methodName for javap output.` : ''].filter(Boolean).join(' ') } : {}),
+        };
+    }
+
+    /** true = a sources JAR was downloaded; string = why not (shown to the agent); undefined = not requested. */
+    private async tryDownloadSources(candidate: ClassCandidate, contextPath: string, args: any): Promise<true | string | undefined> {
+        const requested = args.downloadSources ?? /^(1|true|yes)$/i.test(process.env.JAVA_INSPECTOR_DOWNLOAD_SOURCES ?? '');
+        if (!requested) return undefined;
+        const coordinates = artifactService.coordinatesFromJarPath(candidate.jarPath);
+        if (!coordinates.groupId || !coordinates.artifactId || !coordinates.version) return 'downloadSources skipped: the JAR is not in a Maven repository layout.';
+        const key = `${coordinates.groupId}:${coordinates.artifactId}:${coordinates.version}`;
+        let attempt = this.sourceDownloads.get(key);
+        if (!attempt) {
+            attempt = this.scanner.downloadSources(contextPath, coordinates as { groupId: string; artifactId: string; version: string });
+            this.sourceDownloads.set(key, attempt);
+        }
+        const result = await attempt;
+        const sourceJar = candidate.jarPath.replace(/\.jar$/i, '-sources.jar');
+        if (result.ok && await fs.pathExists(sourceJar)) return true;
+        return `No sources JAR could be downloaded for ${key}${result.message ? ` (${result.message})` : ''}; showing decompiled code.`;
     }
 
     private sliceSource(source: string, args: any): SourceSlice {
