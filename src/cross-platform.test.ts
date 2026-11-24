@@ -310,7 +310,9 @@ describe('Cross-Platform Compatibility', () => {
 
         it('should configure shell=true on Windows', async () => {
             Object.defineProperty(process, 'platform', { value: 'win32' });
-            process.env.MAVEN_CMD = 'mvn';
+            // The config line is logged before execFile; a missing command fails at once
+            // instead of running a real (slow, network-dependent) Maven build.
+            process.env.MAVEN_CMD = 'java-inspector-no-such-mvn';
 
             const logger = Logger.get(projectPath);
             const debugSpy = jest.spyOn(logger, 'debug').mockImplementation(() => {});
@@ -330,7 +332,9 @@ describe('Cross-Platform Compatibility', () => {
 
         it('should configure shell=false on Linux', async () => {
             Object.defineProperty(process, 'platform', { value: 'linux' });
-            process.env.MAVEN_CMD = 'mvn';
+            // The config line is logged before execFile; a missing command fails at once
+            // instead of running a real (slow, network-dependent) Maven build.
+            process.env.MAVEN_CMD = 'java-inspector-no-such-mvn';
 
             const logger = Logger.get(projectPath);
             const debugSpy = jest.spyOn(logger, 'debug').mockImplementation(() => {});
@@ -346,6 +350,6 @@ describe('Cross-Platform Compatibility', () => {
             );
             expect(shellLog).toBeDefined();
             debugSpy.mockRestore();
-        });
+        }, 15000);
     });
 });
