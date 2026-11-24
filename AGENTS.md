@@ -10,11 +10,11 @@ TypeScript MCP server that decompiles Java classes from Maven dependencies using
 | Build (compile `src/` → `dist/`) | `npm run build` |
 | Run dev (no build step) | `npm run dev` (uses `tsx`) |
 | Start built server | `npm start` |
-| Test | `npm test` (Jest, currently no test files exist) |
+| Test | `npm test` (Jest + ts-jest, ESM) |
 | Publish prep | `npm run prepublishOnly` (runs `tsc`) |
 
 ## Runtime requirements
-- **Node.js ≥ 16**
+- **Node.js ≥ 20** (required by commander 14 and the MCP SDK)
 - **Java runtime** (for Vineflower decompiler and `javap`)
 - **Maven** (for `dependency:build-classpath` scanning)
 
@@ -22,14 +22,16 @@ TypeScript MCP server that decompiles Java classes from Maven dependencies using
 
 | File | Role |
 |------|------|
-| `src/index.ts` | MCP server (`JavaClassAnalyzerMCPServer`). Exposes 5 tools: `scan_dependencies`, `decompile_class`, `analyze_class`, `search_class`, `get_inheritance_tree` |
+| `src/index.ts` | MCP server (`JavaClassAnalyzerMCPServer`, built on `McpServer.registerTool`). Exposes 10 read-only tools: `scan_project`, `find_jar`, `inspect_jar`, `search_class`, `search_code`, `find_implementations`, `inspect_class`, `explain_dependency`, `search_resources`, `read_resource`. `SERVER_INSTRUCTIONS` is sent to clients on initialize. |
 | `src/cli.ts` | Commander CLI. Default action (no args) starts the MCP server |
 | `src/cache/ProjectCache.ts` | Cache I/O: JSONL append-only persistence, in-memory `Map` index, pom/classpath hash validation, **cross-process file locking** via `proper-lockfile` |
-| `src/scanner/DependencyScanner.ts` | Runs `mvn dependency:build-classpath`, parses JAR paths. Singleton. Integrates BackgroundScanner + LazyResolver |
+| `src/scanner/DependencyScanner.ts` | Runs `mvn -B dependency:build-classpath` with one output file per reactor module (`cp-${project.groupId}__${project.artifactId}.txt`), merges and de-duplicates JAR paths. Singleton. Integrates BackgroundScanner + LazyResolver |
+| `src/scanner/ArtifactService.ts` | Selector resolution (workspace / jarPath / jarDirectory / prefix / coordinates), class, code and resource search |
+| `src/scanner/ProjectDiscovery.ts` | Breadth-first top-level `pom.xml` discovery (depth ≤ 4, ≤ 5,000 dirs, 30 s cache) |
 | `src/scanner/BackgroundScanner.ts` | Background batch parallel JAR scanning (20 JARs at a time). Writes to JSONL incrementally |
 | `src/scanner/LazyResolver.ts` | On-demand class resolution: O(1) memory lookup, parallel JAR search on cache miss |
-| `src/decompiler/DecompilerService.ts` | Extracts `.class` from JARs (via `yauzl`), runs Vineflower (`java -jar vineflower.jar <class> <outdir>`). Reads generated `.java` from output dir and cleans up temp files |
-| `src/analyzer/JavaClassAnalyzer.ts` | Runs `javap -v -cp <jar> <class>` and parses the text output |
+| `src/decompiler/DecompilerService.ts` | Extracts `Outer.class` **and all `Outer$*.class`** from the JAR (via `yauzl`), runs Vineflower (`java -jar vineflower.jar -e=<jar> <classes...> <outdir>`). Reads generated `.java` from output dir and cleans up temp files |
+| `src/analyzer/JavaClassAnalyzer.ts` | Runs `javap` (`-p` signatures for the API view, `-c -l -p -s` for bytecode, `-v` parsing for hierarchy) |
 | `src/utils/methodExtractor.ts` | Extracts a single method body from decompiled source via regex + brace matching. Handles strings, line/block comments, nested braces, and abstract methods. |
 | `src/utils/cachePaths.ts` | Cache lives under **`~/.cache/java-inspector/<project>_<hash>/`** |
 
@@ -67,7 +69,7 @@ TypeScript MCP server that decompiles Java classes from Maven dependencies using
 - JAR class extraction (background scan): 30 s per JAR (`extractClassesFromJarWithTimeout`)
 - Vineflower decompilation: 30 s (`decompileWithVineflower`)
 - `javap` analysis: 10 s (`analyzeClassWithJavap`)
-- Maven `dependency:build-classpath`: 120 s timeout
+- Maven `dependency:build-classpath`: 300 s timeout; `dependency:tree` (explain_dependency): 120 s
 - Lazy JAR search (on-demand): 5 s per JAR (`findClassInJar`)
 - `execFile` for Maven uses `shell: true` on Windows.
 
@@ -134,38 +136,30 @@ Two-tier locking prevents race conditions across multiple MCP server instances:
 
 ## Tool behavior
 
-### `scan_dependencies`
-- **Non-blocking**: Returns immediately with status (`complete` or `in_progress`)
-- On first call: resolves Maven classpath (~5-10 s), starts background scan
-- On subsequent calls: returns current progress or cached complete index
-- `forceRefresh`: invalidates disk + memory cache, force-releases locks, restarts scan
-- **Cross-process safety**: If another process is already scanning the same project, returns `in_progress` with a message instead of starting a duplicate scan
+All tools are registered with `readOnlyHint: true`. Handler errors are returned as `isError: true` results (never as JSON-RPC errors) — keep the `await` in the `register()` wrapper in `src/index.ts`.
+
+Tool descriptions and `SERVER_INSTRUCTIONS` are what make agents choose these tools over shelling out to `javap`/`unzip`. When adding or changing a tool, say in its description which shell command it replaces and describe every parameter.
+
+### `scan_project`
+- **Non-blocking**: returns immediately with `complete` or `in_progress`. Normally not needed because of auto-scan.
+- `forceRefresh`: invalidates disk + memory cache, force-releases locks, restarts scan.
+- **Cross-process safety**: if another process holds `scan.lock`, returns `in_progress`.
 
 ### Auto-scan on startup
-If the MCP server is launched from a directory containing `pom.xml`, it automatically
-starts `scan_dependencies` in the background during server initialization. This is
-non-blocking — the server accepts tool calls immediately. If `pom.xml` is not found
-in `cwd`, the server logs `"No Maven project detected at cwd, skipping auto-scan."` and starts normally, waiting for manual `scan_dependencies` calls.
+After the transport connects, top-level `pom.xml` directories under `cwd` are discovered (bounded BFS) and scanned in the background. Other tools work immediately on the partial index and report `complete: false`.
 
-### `decompile_class`
-- `ensureScanStarted()` checks if index exists. If not, starts background scan (non-blocking).
-- `findJarForClass()` first checks in-memory `Map` (O(1)). If miss, searches JARs on-demand in parallel batches.
-- Temp `.class` file is **always cleaned up** after decompilation (regardless of `useCache`).
-- Vineflower writes output to a temporary directory; the generated `.java` file is read and the temp directory is cleaned up automatically.
-- **Method extraction**: pass `methodName` to extract a single method body instead of the full class. Uses `methodExtractor.ts` (regex + brace matching).
-- **Pagination**: pass `offset` (1-based) and `limit` to return a slice of lines. `limit=0` means all lines. Ignored when `methodName` is provided.
+### `inspect_class`
+- Requires an **exact** class name match (FQN, or simple name if unique). Never falls back to fuzzy matches; on a miss it errors with similar class suggestions.
+- `view=source`: embedded `.java` → `*-sources.jar` → Vineflower. Response states the source origin. `methodName`/`paramTypes` extract one method; `offset`/`limit` page lines and the response reports `Lines: x-y of N`.
+- `view=api`: `javap -p` output (plus class-file metadata in `json` format).
+- `view=hierarchy`: superclass chain with interfaces per level.
+- `view=bytecode`: `javap -c -l -p -s`.
 
-### `analyze_class`
-- `ensureScanStarted()` checks if index exists. If not, starts background scan (non-blocking).
-- `findJarForClass()` first checks in-memory `Map` (O(1)). If miss, searches JARs on-demand in parallel batches.
-
-### `search_class`
-- Iterates the live in-memory Map. Returns partial results if background scan is still running.
-- Adds a note about scan completion percentage when incomplete.
+### `search_class` / `search_code` / `find_implementations` / `search_resources`
+- Use the live in-memory index first, then open unindexed JARs on demand within a per-call budget; `complete: false` + `remainingJarCount` tell the agent to call again or narrow with `jarNamePrefix`/`jarPath`.
 
 ## Gotchas
-- No Jest config file exists; `npm test` relies on Jest defaults.
-- Test files: `src/utils/CrossProcessLock.test.ts` covers cross-process lock behavior.
+- Jest config is `jest.config.js` (ts-jest ESM). Every module has a `*.test.ts` next to it.
 - The scanner uses `mvn dependency:build-classpath`, not `dependency:tree`. No regex parsing.
 - `yauzl` is used for ZIP/JAR reading (streams, lazy entries). Be careful with resource leaks; the code already ignores close errors in catch blocks.
 - Inner classes (`$` in filename) are intentionally skipped during index building.

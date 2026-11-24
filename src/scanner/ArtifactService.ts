@@ -439,13 +439,16 @@ export class ArtifactService {
         contentQuery?: string,
         limit: number = 20,
     ): Promise<ResourceSearchResult> {
-        const candidates = await this.candidateJarsForDeepSearch(selector, 20);
+        // Previously capped at the first 20 classpath JARs, so a workspace-wide search could never see the rest.
+        const candidates = await this.candidateJarsForDeepSearch(selector, 10_000);
         const jars = candidates.jars;
         const errors = [...candidates.errors];
         const results: Array<{ jarPath: string; resourcePath: string; size: number; contentMatch?: string }> = [];
+        const deadline = Date.now() + 20_000;
         const lowerPath = pathQuery.toLowerCase();
         const lowerContent = contentQuery?.toLowerCase();
         for (const candidate of jars) {
+            if (Date.now() > deadline) return { results, complete: false, errors };
             const context = selector.workspacePath || candidate.contextPath || path.dirname(candidate.jarPath);
             let index: JarLightIndex;
             try {

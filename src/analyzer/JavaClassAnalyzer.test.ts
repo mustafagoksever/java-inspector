@@ -217,6 +217,31 @@ public class com.example.Foo extends java.lang.Object implements java.lang.Runna
             expect(analysis.modifiers).toContain('public');
             expect(analysis.className).toBe('Marker');
         });
+
+        const empty = () => ({ className: '', packageName: '', modifiers: [], superClass: undefined, interfaces: [], fields: [], methods: [] });
+
+        it('strips generics from superclass and generic interfaces', () => {
+            const analysis: any = empty();
+            (analyzer as any).parseClassDeclaration('public class java.util.ArrayList<E> extends java.util.AbstractList<E> implements java.util.List<E>, java.util.RandomAccess {', analysis);
+            expect(analysis.superClass).toBe('java.util.AbstractList');
+            expect(analysis.interfaces).toEqual(['java.util.List', 'java.util.RandomAccess']);
+        });
+
+        it('treats interface extends as super-interfaces, not a superclass', () => {
+            const analysis: any = empty();
+            (analyzer as any).parseClassDeclaration('public interface java.util.List<E> extends java.util.SequencedCollection<E> {', analysis);
+            expect(analysis.superClass).toBeUndefined();
+            expect(analysis.interfaces).toEqual(['java.util.SequencedCollection']);
+        });
+    });
+
+    describe('parseJavapOutput', () => {
+        it('recognises abstract / final class declarations', () => {
+            const output = 'Compiled from "AbstractList.java"\npublic abstract class java.util.AbstractList<E> extends java.util.AbstractCollection<E> implements java.util.List<E> {\n}\n';
+            const analysis = (analyzer as any).parseJavapOutput(output, 'java.util.AbstractList');
+            expect(analysis.superClass).toBe('java.util.AbstractCollection');
+            expect(analysis.modifiers).toEqual(expect.arrayContaining(['public', 'abstract']));
+        });
     });
 
     describe('getJavapCommand', () => {

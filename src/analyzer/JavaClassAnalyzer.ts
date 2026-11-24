@@ -33,6 +33,8 @@ export interface HierarchyEntry {
     className: string;
     level: number;
     resolved: boolean;
+    /** Directly implemented interfaces (super-interfaces for an interface). */
+    interfaces?: string[];
 }
 
 export class JavaClassAnalyzer {
@@ -57,7 +59,7 @@ export class JavaClassAnalyzer {
             const jarPath = await this.scanner.findJarForClass(className, projectPath);
             if (!jarPath) {
                 const suggestion = className.includes('.')
-                    ? `Ensure the class name is correct and belongs to a Maven dependency. You may need to run scan_dependencies first.`
+                    ? `Ensure the class name is correct and belongs to a Maven dependency. You may need to run scan_project first.`
                     : `Class name looks like a simple name. Try using the fully qualified name (e.g. com.example.${className}).`;
                 throw new Error(`JAR package for class ${className} not found. ${suggestion}`);
             }
@@ -90,6 +92,17 @@ export class JavaClassAnalyzer {
         return this.parseJavapOutput(output, className);
     }
 
+    /**
+     * Compact `javap -p` member listing (generic signatures, all visibilities).
+     * This is the format agents otherwise get by shelling out to javap.
+     */
+    async getSignatures(className: string, contextPath: string, options: { jarPath?: string; classFile?: string } = {}): Promise<string> {
+        const args = options.classFile
+            ? ['-p', options.classFile]
+            : options.jarPath ? ['-p', '-cp', options.jarPath, className] : ['-p', className];
+        return this.runJavap(args, Logger.get(contextPath));
+    }
+
     async getBytecode(className: string, contextPath: string, jarPath?: string): Promise<string> {
         const args = jarPath
             ? ['-c', '-l', '-p', '-s', '-cp', jarPath, className]
@@ -115,7 +128,7 @@ export class JavaClassAnalyzer {
         try {
             const javapCmd = this.getJavapCommand(logger);
             const args = verbose
-                ? ['-v', '-cp', jarPath, className]
+                ? ['-v', '-p', '-cp', jarPath, className]
                 : ['-cp', jarPath, className];
 
             logger?.debug(`[JAVAP] Running: ${javapCmd} ${args.join(' ')}`);
@@ -169,8 +182,7 @@ export class JavaClassAnalyzer {
             const trimmedLine = line.trim();
 
             // Parse class declaration
-            if (trimmedLine.startsWith('public class') || trimmedLine.startsWith('public interface') ||
-                trimmedLine.startsWith('public enum')) {
+            if (/^(?:(?:public|protected|private|abstract|final|static|sealed|non-sealed|strictfp)\s+)*(?:class|interface|enum|record|@interface)\s/.test(trimmedLine) && !trimmedLine.includes('(')) {
                 this.parseClassDeclaration(trimmedLine, analysis);
                 continue;
             }
@@ -262,7 +274,7 @@ export class JavaClassAnalyzer {
         analysis.modifiers = modifiers;
 
         // Extract package name (inferred from class name)
-        const classMatch = line.match(/(?:public\s+)?(?:class|interface|enum)\s+([a-zA-Z_$][a-zA-Z0-9_$.]*)/);
+        const classMatch = line.match(/(?:class|interface|enum|record)\s+([a-zA-Z_$][a-zA-Z0-9_$.]*)/);
         if (classMatch) {
             const fullClassName = classMatch[1];
             const parts = fullClassName.split('.');
@@ -273,19 +285,32 @@ export class JavaClassAnalyzer {
         }
 
         // Extract superclass
-        const extendsMatch = line.match(/extends\s+([a-zA-Z_$][a-zA-Z0-9_$.]*)/);
+        const stripGenerics = (value: string) => {
+            let depth = 0, out = '';
+            for (const ch of value) {
+                if (ch === '<') depth++;
+                else if (ch === '>') depth--;
+                else if (depth === 0) out += ch;
+            }
+            return out;
+        };
+        const flat = stripGenerics(line);
+        const isInterface = /\binterface\s/.test(flat);
+        const extendsMatch = flat.match(/extends\s+([^{]+?)(?:\s+implements\b|\s*\{|$)/);
         if (extendsMatch) {
-            analysis.superClass = extendsMatch[1];
+            const parents = extendsMatch[1].split(',').map(item => item.trim()).filter(Boolean);
+            // For interfaces, "extends" lists super-interfaces, not a superclass.
+            if (isInterface) analysis.interfaces.push(...parents);
+            else analysis.superClass = parents[0];
         }
 
         // Extract interfaces
-        const implementsMatch = line.match(/implements\s+([^{]+)/);
+        const implementsMatch = flat.match(/implements\s+([^{]+)/);
         if (implementsMatch) {
-            const interfaces = implementsMatch[1]
+            analysis.interfaces = implementsMatch[1]
                 .split(',')
                 .map(iface => iface.trim())
                 .filter(iface => iface);
-            analysis.interfaces = interfaces;
         }
     }
 

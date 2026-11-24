@@ -41,4 +41,11 @@ describe('ProjectDiscovery', () => {
         }
         await expect(discovery.findTopLevelPomDirectories(workspace)).resolves.toEqual([]);
     });
+
+    it('does not descend deeper than the depth limit', async () => {
+        const deep = path.join(workspace, 'l1', 'l2', 'l3', 'l4', 'l5');
+        fs.mkdirSync(deep, { recursive: true });
+        fs.writeFileSync(path.join(deep, 'pom.xml'), '<project/>');
+        await expect(new ProjectDiscovery().findTopLevelPomDirectories(workspace)).resolves.toEqual([]);
+    });
 });

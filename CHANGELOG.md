@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Migrated to `@modelcontextprotocol/sdk` 1.32 (`McpServer.registerTool`, protocol 2025-11-25). Tool input schemas are now zod-validated and every parameter has a description.
+- The server now sends `instructions` in the initialize response and every tool has `title` and read-only `annotations`. Tool descriptions say explicitly which shell commands they replace (`javap`, `unzip -l`, `jar tf`, `find ~/.m2`, `mvn dependency:tree`), so agents pick them without being told to.
+- `inspect_class` `view: "api"` now returns compact `javap -p` signatures (all visibilities, generic signatures) instead of a large JSON dump that omitted fields and non-public members.
+- `inspect_class` source responses report `Source origin` (sources JAR vs decompiled) and, when paging, `Lines: x-y of N`.
+- `engines.node` is now `>=20` (already required in practice by `commander@14`).
+- `view: "hierarchy"` lists the interfaces implemented at every level.
+
+### Fixed
+
+- Tool failures were returned as JSON-RPC protocol errors (`-32603`) because handler promises were returned without `await` inside `try`; they are now `isError` tool results the model can read.
+- `inspect_class` silently fell back to a fuzzy match (e.g. a typo resolved to a different class). It now fails with "Class not found" and lists similar classes.
+- Decompiled source was missing nested/inner class bodies because only `Outer.class` was given to Vineflower. All `Outer$*.class` entries are now passed, plus the JAR as a library (`-e=`) for better type resolution. Temp directories are unique per call.
+- Multi-module Maven projects only indexed the last module's dependencies (every module overwrote the same `-Dmdep.outputFile`). Each module now writes its own file and the results are merged. Maven runs with `-B`.
+- javap parsing ignored `abstract`/`final` class declarations and kept generic arguments, which broke JDK hierarchies (e.g. `AbstractList` had no superclass, `List` reported `java.lang.Object`).
+- `search_resources` only ever searched the first 20 classpath JARs.
+- Workspace POM discovery had no depth limit; started from `/` or `~` it walked the entire disk on every tool call. It is now bounded (depth 4, 5,000 directories) and cached for 30 s.
+- User-facing messages referred to the removed `scan_dependencies` tool.
+- An `offset` past the end of the source returned an empty body; it is now an explicit error.
+
 ## [2.2.1] - 2025-04-25
 
 ### Fixed

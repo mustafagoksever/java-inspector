@@ -28,7 +28,7 @@ export class LazyResolver {
         // 2. Get classpath
         const jarPaths = await projectCache.getClasspath(projectPath);
         if (!jarPaths || jarPaths.length === 0) {
-            throw new Error('Classpath not found. Please run scan_dependencies first.');
+            throw new Error('Classpath not found. Please run scan_project first.');
         }
 
         // 3. Exclude already-scanned JARs if we have a partial index

@@ -270,6 +270,30 @@ describe('DecompilerService', () => {
         });
     });
 
+    describe('extractClassFamily', () => {
+        it('extracts the outer class together with its nested classes, outer first', async () => {
+            const s = new DecompilerService();
+            const jarPath = path.resolve('lib', 'vineflower-1.11.2.jar');
+            const target = path.join(projectPath, 'family');
+            const files: string[] = await (s as any).extractClassFamily(jarPath, 'org/jetbrains/java/decompiler/main/decompiler/ConsoleDecompiler.class', target);
+            expect(path.basename(files[0])).toBe('ConsoleDecompiler.class');
+            expect(files.map(file => path.basename(file))).toContain('ConsoleDecompiler$SaveType.class');
+            expect(files.every(file => fs.existsSync(file))).toBe(true);
+        });
+
+        it('passes nested classes and the JAR as library to Vineflower', async () => {
+            const s = new DecompilerService();
+            const spy = jest.fn<any>().mockResolvedValue('class X {}');
+            (s as any).decompileWithVineflower = spy;
+            (s as any).resolveDecompilerPath = async () => '/fake/vineflower.jar';
+            const jarPath = path.resolve('lib', 'vineflower-1.11.2.jar');
+            await s.decompileClassFromJar('org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler', jarPath, projectPath, undefined, false);
+            const [sources, , , , , libraries] = spy.mock.calls[0] as any[];
+            expect(sources.length).toBeGreaterThan(1);
+            expect(libraries).toEqual([jarPath]);
+        });
+    });
+
     describe('extractClassFile', () => {
         it('should extract class file from JAR', async () => {
             const s = new DecompilerService();

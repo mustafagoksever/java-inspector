@@ -1,6 +1,6 @@
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { z } from 'zod';
 import { encode as toonEncode } from '@toon-format/toon';
 import { fileURLToPath } from 'url';
 import { readFileSync } from 'fs';
@@ -23,109 +23,147 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const { version } = JSON.parse(readFileSync(path.resolve(__dirname, '../package.json'), 'utf-8'));
 type Format = 'text' | 'json' | 'toon';
+type SourceSlice = { source: string; sourceRange?: { startLine: number; endLine: number; totalLines: number }; sourceOrigin?: 'embedded-source' | 'sources-jar' | 'decompiled' | 'jdk-src.zip' };
 type Progress = (message: string, progress?: number, total?: number) => Promise<void>;
 
-const FORMAT_PROPERTY = { type: 'string', enum: ['text', 'json', 'toon'], default: 'text', description: 'Output format.' };
-const SELECTOR_PROPERTIES = {
-    workspacePath: { type: 'string', description: 'Absolute Java workspace path. Maven is optional.' },
-    jarPath: { type: 'string', description: 'Absolute path to an exact JAR. Fastest selector.' },
-    jarDirectory: { type: 'string', description: 'Absolute directory to search for a JAR on demand.' },
-    jarNamePrefix: { type: 'string', description: 'JAR basename prefix.' },
-    coordinates: { type: 'string', description: 'groupId:artifactId[:version[:classifier]].' },
+/**
+ * Sent to the client in the initialize response. Clients such as Claude Code and
+ * Cursor inject this into the model's context, which is what makes the agent pick
+ * these tools over shelling out to javap / unzip / jar / find ~/.m2.
+ */
+export const SERVER_INSTRUCTIONS = `java-inspector gives read-only access to compiled Java code: Maven dependencies of the workspace, local JAR/WAR/Spring Boot fat JARs, and JDK classes.
+
+Prefer these tools over shell commands for anything inside a JAR or the JDK:
+- Instead of \`javap\` / \`javap -c\` / \`javap -p\`: inspect_class with view "api" (signatures) or "bytecode".
+- Instead of decompiling by hand or guessing library behaviour: inspect_class with view "source" (uses -sources.jar when present, otherwise Vineflower). Pass methodName to get a single method.
+- Instead of \`unzip -l\`, \`jar tf\`, \`find ~/.m2 -name\`, \`grep -r\` over JARs: search_class, find_jar, inspect_jar, search_resources, read_resource.
+- Instead of \`mvn dependency:tree\`: explain_dependency.
+- To find who implements an interface or calls/declares a member or uses a string: find_implementations / search_code.
+
+Workflow: search_class (simple or partial name) -> inspect_class (fully qualified name). No scan is required first: the Maven classpath is resolved in the background at startup and tools return partial results with complete=false instead of waiting. When a result is ambiguous, the response lists candidates; repeat the call with jarPath set to one of them. All paths must be absolute.`;
+
+const FORMAT = z.enum(['text', 'json', 'toon']).default('text').describe('Response format. "text" is compact and human-readable; "json" returns the full structured result; "toon" is a token-efficient structured encoding.');
+const MODE = z.enum(['fast', 'balanced']).default('balanced').describe('"fast" opens fewer unindexed JARs per call (lower latency, more likely partial); "balanced" opens more.');
+const num = (description: string) => z.coerce.number().int().optional().describe(description);
+const SELECTOR = {
+    workspacePath: z.string().optional().describe('Absolute path of the Java workspace (directory containing pom.xml, or a parent of several Maven projects). Defaults to the server cwd when no other selector is given.'),
+    jarPath: z.string().optional().describe('Absolute path to one exact JAR. Fastest and unambiguous; use it when a previous response listed candidate JARs.'),
+    jarDirectory: z.string().optional().describe('Absolute directory to search for JARs on demand (for non-Maven projects, e.g. a lib/ folder).'),
+    jarNamePrefix: z.string().optional().describe('Restrict to JARs whose file name starts with this, e.g. "spring-web" or "jackson-databind-2.17".'),
+    coordinates: z.string().optional().describe('Maven coordinates groupId:artifactId[:version[:classifier]] resolved from the local repository, e.g. "com.fasterxml.jackson.core:jackson-databind".'),
 };
+const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
 
 export class JavaClassAnalyzerMCPServer {
-    private server: Server;
+    private mcp: McpServer;
     private analyzer = new JavaClassAnalyzer();
     private scanner = new DependencyScanner();
     private decompiler = new DecompilerService();
 
+    /** Low-level protocol server (kept for tests and advanced use). */
+    get server() { return this.mcp.server; }
+
     constructor() {
-        this.server = new Server({ name: 'java-inspector', version }, { capabilities: { tools: {}, logging: {} } });
+        this.mcp = new McpServer(
+            { name: 'java-inspector', title: 'Java Inspector', version },
+            { capabilities: { tools: {}, logging: {} }, instructions: SERVER_INSTRUCTIONS },
+        );
         this.setupHandlers();
     }
 
     private setupHandlers(): void {
-        this.server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [
-            {
-                name: 'scan_project',
-                description: 'Start, refresh, or poll the non-blocking Maven dependency scan. Startup automatically calls this for the highest-level pom.xml files.',
-                inputSchema: { type: 'object', properties: { workspacePath: { type: 'string' }, forceRefresh: { type: 'boolean', default: false }, format: FORMAT_PROPERTY }, required: ['workspacePath'] },
-            },
-            {
-                name: 'find_jar',
-                description: 'Find JAR paths by exact path, filename, prefix, substring, or Maven coordinates without opening the JAR.',
-                inputSchema: { type: 'object', properties: { ...SELECTOR_PROPERTIES, match: { type: 'string', enum: ['exact', 'prefix', 'contains'], default: 'prefix' }, limit: { type: 'number', default: 20 }, format: FORMAT_PROPERTY } },
-            },
-            {
-                name: 'inspect_jar',
-                description: 'Inspect one JAR: manifest, Maven coordinates, layout, packages, classes, resources, and nested JAR metadata.',
-                inputSchema: { type: 'object', properties: { ...SELECTOR_PROPERTIES, query: { type: 'string' }, offset: { type: 'number', default: 1 }, limit: { type: 'number', default: 100 }, format: FORMAT_PROPERTY } },
-            },
-            {
-                name: 'search_class',
-                description: 'Search the live partial index, then foreground-scan only relevant JARs without waiting for background scan completion.',
-                inputSchema: { type: 'object', properties: { query: { type: 'string' }, ...SELECTOR_PROPERTIES, includeJdk: { type: 'boolean', default: false }, mode: { type: 'string', enum: ['fast', 'balanced'], default: 'balanced' }, limit: { type: 'number', default: 20 }, format: FORMAT_PROPERTY }, required: ['query'] },
-            },
-            {
-                name: 'search_code',
-                description: 'Find method/field declarations, annotations, references, and real string constants from lazy class-file metadata.',
-                inputSchema: { type: 'object', properties: { query: { type: 'string' }, kind: { type: 'string', enum: ['method', 'field', 'annotation', 'reference', 'string'] }, ...SELECTOR_PROPERTIES, mode: { type: 'string', enum: ['fast', 'balanced'], default: 'balanced' }, limit: { type: 'number', default: 20 }, format: FORMAT_PROPERTY }, required: ['query', 'kind'] },
-            },
-            {
-                name: 'find_implementations',
-                description: 'Find direct or transitive implementations/subtypes using lazy deep class metadata.',
-                inputSchema: { type: 'object', properties: { className: { type: 'string' }, ...SELECTOR_PROPERTIES, transitive: { type: 'boolean', default: true }, mode: { type: 'string', enum: ['fast', 'balanced'], default: 'balanced' }, limit: { type: 'number', default: 50 }, format: FORMAT_PROPERTY }, required: ['className'] },
-            },
-            {
-                name: 'inspect_class',
-                description: 'Resolve and inspect a class from Maven, a local JAR, or the JDK. Views: source, API, hierarchy, bytecode, or all.',
-                inputSchema: { type: 'object', properties: { className: { type: 'string' }, ...SELECTOR_PROPERTIES, view: { type: 'string', enum: ['source', 'api', 'hierarchy', 'bytecode', 'all'], default: 'source' }, methodName: { type: 'string' }, paramTypes: { type: 'array', items: { type: 'string' } }, offset: { type: 'number', default: 1 }, limit: { type: 'number', default: 0 }, useCache: { type: 'boolean', default: true }, format: FORMAT_PROPERTY }, required: ['className'] },
-            },
-            {
-                name: 'explain_dependency',
-                description: 'Run a filtered Maven dependency tree and explain why an artifact is present.',
-                inputSchema: { type: 'object', properties: { workspacePath: { type: 'string' }, coordinates: { type: 'string' }, jarPath: { type: 'string' }, format: FORMAT_PROPERTY }, required: ['workspacePath'] },
-            },
-            {
-                name: 'search_resources',
-                description: 'Search resource paths or bounded text resource content in selected JARs.',
-                inputSchema: { type: 'object', properties: { ...SELECTOR_PROPERTIES, pathQuery: { type: 'string', default: '' }, contentQuery: { type: 'string' }, limit: { type: 'number', default: 20 }, format: FORMAT_PROPERTY } },
-            },
-            {
-                name: 'read_resource',
-                description: 'Read an exact text resource with safe line pagination. Binary resources are rejected.',
-                inputSchema: { type: 'object', properties: { ...SELECTOR_PROPERTIES, resourcePath: { type: 'string' }, offset: { type: 'number', default: 1 }, limit: { type: 'number', default: 200 }, format: FORMAT_PROPERTY }, required: ['resourcePath'] },
-            },
-        ] }));
+        type Handler = (args: any, sendProgress: Progress) => Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }>;
+        const register = (name: string, title: string, description: string, inputSchema: z.ZodRawShape, handler: Handler) => {
+            this.mcp.registerTool(name, { title, description, inputSchema, annotations: { title, ...READ_ONLY } }, async (args: any, extra: any) => {
+                const sendProgress: Progress = async (message, progress, total) => {
+                    const progressToken = extra?._meta?.progressToken;
+                    if (progressToken === undefined) return;
+                    // MCP requires a numeric progress value on every progress notification.
+                    await extra.sendNotification({ method: 'notifications/progress', params: { progressToken, message, progress: progress ?? 0, total } }).catch(() => {});
+                };
+                try {
+                    // Must be awaited: returning the bare promise would let rejections escape this
+                    // try/catch and surface as JSON-RPC protocol errors instead of tool errors the model can read.
+                    return await handler(args, sendProgress);
+                } catch (error) {
+                    const message = error instanceof Error ? error.message : String(error);
+                    return { content: [{ type: 'text' as const, text: `Tool call failed: ${message}` }], isError: true };
+                }
+            });
+        };
 
-        this.server.setRequestHandler(CallToolRequestSchema, async (request: any, extra: any) => {
-            const { name, arguments: args = {} } = request.params;
-            const sendProgress: Progress = async (message, progress, total) => {
-                if (extra._meta?.progressToken !== undefined) {
-                    await extra.sendNotification({ method: 'notifications/progress', params: { progressToken: extra._meta.progressToken, message, progress, total } });
-                }
-            };
-            try {
-                switch (name) {
-                    case 'scan_project': return this.handleScanProject(args, sendProgress);
-                    case 'find_jar': return this.handleFindJar(args);
-                    case 'inspect_jar': return this.handleInspectJar(args);
-                    case 'search_class': return this.handleSearchClass(args, sendProgress);
-                    case 'search_code': return this.handleSearchCode(args, sendProgress);
-                    case 'find_implementations': return this.handleFindImplementations(args, sendProgress);
-                    case 'inspect_class': return this.handleInspectClass(args, sendProgress);
-                    case 'explain_dependency': return this.handleExplainDependency(args, sendProgress);
-                    case 'search_resources': return this.handleSearchResources(args);
-                    case 'read_resource': return this.handleReadResource(args);
-                    default: throw new Error(`Unknown tool: ${name}`);
-                }
-            } catch (error) {
-                const message = error instanceof Error ? error.message : String(error);
-                await sendProgress(`Failed: ${message}`);
-                return { content: [{ type: 'text', text: `Tool call failed: ${message}` }], isError: true };
-            }
-        });
+        register('scan_project', 'Scan Maven dependencies',
+            'Start, refresh, or poll the background index of a Maven workspace\'s dependency JARs. Returns immediately. ' +
+            'Usually NOT needed: the server auto-scans the top-level pom.xml files under its cwd at startup and every other tool works on a partial index. ' +
+            'Call it to index a different workspace, to check progress, or with forceRefresh=true after pom.xml changes.',
+            { workspacePath: z.string().describe('Absolute workspace path containing pom.xml (or parent of several Maven projects).'), forceRefresh: z.boolean().default(false).describe('Drop the cached classpath/index and re-run Maven.'), format: FORMAT },
+            (args, progress) => this.handleScanProject(args, progress));
+
+        register('find_jar', 'Find JAR',
+            'Locate dependency/local JAR files by file name prefix, substring, exact name, or Maven coordinates, without opening them. ' +
+            'Use instead of `find ~/.m2 -name "*.jar"` or `ls lib/`. Returns absolute jarPath values usable as the jarPath selector of other tools.',
+            { ...SELECTOR, match: z.enum(['exact', 'prefix', 'contains']).default('prefix').describe('How jarNamePrefix / the coordinates artifactId is matched against JAR file names.'), limit: num('Max results (1-100, default 20).'), format: FORMAT },
+            args => this.handleFindJar(args));
+
+        register('inspect_jar', 'Inspect JAR contents',
+            'List what is inside ONE JAR: manifest, Maven coordinates (pom.properties), layout (plain, Spring Boot, WAR, multi-release), packages, classes, resources and nested JARs. ' +
+            'Use instead of `unzip -l` / `jar tf`. If the selector matches several JARs, candidates are returned; repeat with jarPath. Entries are paginated with offset/limit and can be filtered with query.',
+            { ...SELECTOR, query: z.string().optional().describe('Case-insensitive substring filter on class names and resource paths.'), offset: num('1-based index of the first entry to return (default 1).'), limit: num('Max entries to return (1-1000, default 100).'), format: FORMAT },
+            args => this.handleInspectJar(args));
+
+        register('search_class', 'Search classes',
+            'Find classes by simple name, fully qualified name, or partial name (e.g. "ObjectMapper", "jackson ObjectMapper", "web.client.RestTemplate") across the workspace\'s Maven dependencies, a JAR directory, or one JAR. ' +
+            'First step before inspect_class when the package is unknown. Uses the live (possibly still-building) index and opens unindexed JARs on demand; complete=false means more JARs remain, so call again or narrow with jarNamePrefix. ' +
+            'Use instead of `unzip -l *.jar | grep` or `find ~/.m2`.',
+            { query: z.string().describe('Class name or fragment. Space/dot separated parts must all appear in the fully qualified name.'), ...SELECTOR, includeJdk: z.boolean().default(false).describe('Also search JDK classes (java.*, javax.*, jdk.*).'), mode: MODE, limit: num('Max results (1-100, default 20).'), format: FORMAT },
+            (args, progress) => this.handleSearchClass(args, progress));
+
+        register('search_code', 'Search compiled code',
+            'Search bytecode metadata without decompiling: method or field declarations by name, annotations, references (calls/field accesses to an owner#member), or string constants (e.g. an exception message or config key). ' +
+            'Use to answer "where is this log/error message thrown?", "who calls RestTemplate#exchange?", "which classes are annotated @AutoConfiguration?". Use instead of `grep` over decompiled code or `javap -c | grep`. ' +
+            'Deep indexes are built lazily per JAR; complete=false means some JARs were not searched yet. Calling again continues where it stopped; narrowing with jarNamePrefix/jarPath is faster.',
+            { query: z.string().describe('Case-insensitive substring. For kind=reference you may use "Owner#member" or "com.foo.Owner.member".'), kind: z.enum(['method', 'field', 'annotation', 'reference', 'string']).describe('What to search.'), ...SELECTOR, mode: MODE, limit: num('Max matches (1-100, default 20).'), format: FORMAT },
+            (args, progress) => this.handleSearchCode(args, progress));
+
+        register('find_implementations', 'Find implementations',
+            'Find classes that implement an interface or extend a class (direct or transitive) across dependency JARs, using lazily built bytecode indexes. ' +
+            'Use for "what implementations of HttpMessageConverter exist?", SPI lookups, etc. complete=false means more JARs remain; call again to continue.',
+            { className: z.string().describe('Fully qualified name of the interface or superclass, e.g. "org.springframework.core.convert.converter.Converter".'), ...SELECTOR, transitive: z.boolean().default(true).describe('Include indirect subtypes (subclass of an implementation, sub-interfaces).'), mode: MODE, limit: num('Max results (1-200, default 50).'), format: FORMAT },
+            (args, progress) => this.handleFindImplementations(args, progress));
+
+        register('inspect_class', 'Inspect / decompile class',
+            'Show a Java class from a Maven dependency, local JAR, or the JDK. view="source": real source from a -sources.jar if present, otherwise decompiled with Vineflower (inner classes included); pass methodName (and optionally paramTypes) to return a single method, or offset/limit to page large files. ' +
+            'view="api": compact member signatures (replaces `javap -p`). view="bytecode": `javap -c -l -p -s` output. view="hierarchy": superclass chain and interfaces. view="all": everything. ' +
+            'Use this instead of running javap or a decompiler in the shell. Requires the fully qualified class name; use search_class first if you only know the simple name.',
+            {
+                className: z.string().describe('Fully qualified class name, e.g. "com.fasterxml.jackson.databind.ObjectMapper". Nested classes are included in the outer class source view.'),
+                ...SELECTOR,
+                view: z.enum(['source', 'api', 'hierarchy', 'bytecode', 'all']).default('source').describe('Which view to return.'),
+                methodName: z.string().optional().describe('view=source only: return just this method (all overloads unless paramTypes is given).'),
+                paramTypes: z.array(z.string()).optional().describe('Simple or qualified parameter type names to select one overload, e.g. ["String", "int"].'),
+                offset: num('view=source: 1-based first line to return (default 1). The response reports totalLines.'),
+                limit: num('view=source: number of lines to return; 0 = all (default 0).'),
+                useCache: z.boolean().default(true).describe('Reuse cached decompiled source.'),
+                format: FORMAT,
+            },
+            (args, progress) => this.handleInspectClass(args, progress));
+
+        register('explain_dependency', 'Explain dependency',
+            'Explain why an artifact is on the classpath: runs a filtered `mvn dependency:tree -Dincludes=<coordinates> -Dverbose` for each Maven project in the workspace (paths from root to the artifact, conflicts, omitted versions). ' +
+            'Use instead of running mvn dependency:tree yourself. Slower (runs Maven).',
+            { workspacePath: z.string().describe('Absolute workspace path containing pom.xml.'), coordinates: z.string().optional().describe('groupId:artifactId (or groupId only). Optional if jarPath is given.'), jarPath: z.string().optional().describe('Absolute JAR path; coordinates are read from its pom.properties.'), format: FORMAT },
+            (args, progress) => this.handleExplainDependency(args, progress));
+
+        register('search_resources', 'Search JAR resources',
+            'Find non-class files inside JARs (META-INF/spring/*.imports, META-INF/services/*, *.properties, *.xml, *.json ...) by path substring and optionally by text content. ' +
+            'Use instead of `unzip -p x.jar | grep`. Then use read_resource to read a match.',
+            { ...SELECTOR, pathQuery: z.string().default('').describe('Case-insensitive substring of the resource path, e.g. "META-INF/services".'), contentQuery: z.string().optional().describe('Case-insensitive text to look for inside text resources (<= 1 MB).'), limit: num('Max results (1-100, default 20).'), format: FORMAT },
+            args => this.handleSearchResources(args));
+
+        register('read_resource', 'Read JAR resource',
+            'Read one text resource from inside a JAR (exact path as returned by search_resources/inspect_jar), paginated by lines. Binary resources are rejected. Use instead of `unzip -p`.',
+            { ...SELECTOR, resourcePath: z.string().describe('Exact entry path inside the JAR, e.g. "META-INF/spring.factories".'), offset: num('1-based first line (default 1).'), limit: num('Number of lines (1-1000, default 200).'), format: FORMAT },
+            args => this.handleReadResource(args));
     }
 
     private async handleScanProject(args: any, sendProgress?: Progress) {
@@ -208,6 +246,7 @@ export class JavaClassAnalyzerMCPServer {
         await sendProgress?.(`Finding implementations of ${args.className}`, 0, 100);
         const result = await artifactService.findImplementations(args.className, selector, args.transitive !== false, this.clamp(args.limit, 1, 200, 50), args.mode === 'fast' ? 2 : 5);
         let text = result.implementations.length ? `Found ${result.implementations.length} implementation(s):\n${result.implementations.map(item => `- ${item.className} -> ${item.jarPath}`).join('\n')}` : `No implementations found for ${args.className}${result.complete ? '.' : ' in the currently deep-indexed JARs.'}`;
+        if (!result.complete && result.remainingJarCount > 0) text += `\n\nSearch is partial; ${result.remainingJarCount} JAR(s) not deep-indexed yet. Call again to continue, or narrow with jarNamePrefix.`;
         if (result.errors.length) text += `\n${result.errors.map(error => `- ${error.jarPath ?? error.contextPath ?? 'workspace'}: ${error.message}`).join('\n')}`;
         return this.formatResponse(text, result, args.format);
     }
@@ -223,9 +262,16 @@ export class JavaClassAnalyzerMCPServer {
             return this.formatResponse(this.classInspectionText(args.className, result), result, args.format);
         }
         const resolved = await artifactService.resolveClass(args.className, selector);
-        const exact = resolved.results.filter(item => item.className.toLowerCase() === String(args.className).toLowerCase() || item.simpleName.toLowerCase() === String(args.className).toLowerCase());
-        const unique = this.uniqueClassCandidates(exact.length ? exact : resolved.results);
-        if (!unique.length) throw new Error(`Class not found: ${args.className}`);
+        const requested = String(args.className);
+        const isQualified = requested.includes('.');
+        // Never fall back to fuzzy matches here: silently decompiling "FooBar" when "Foo" was asked is worse than an error.
+        const exact = resolved.results.filter(item => isQualified ? item.className === requested : item.simpleName === requested);
+        const unique = this.uniqueClassCandidates(exact);
+        if (!unique.length) {
+            const suggestions = this.uniqueClassCandidates(resolved.results).slice(0, 10).map(item => `- ${item.className} -> ${item.jarPath}`);
+            const partial = resolved.complete ? '' : ' The dependency index is still being built, so it may appear later; narrowing with jarNamePrefix or jarPath searches the right JAR immediately.';
+            throw new Error(`Class not found: ${requested}.${partial}${suggestions.length ? `\nSimilar classes:\n${suggestions.join('\n')}` : ' Use search_class with a partial name.'}`);
+        }
         if (unique.length > 1) return this.ambiguityResponse('Class', unique, args.format);
         let candidate = unique[0];
         let inspection = await artifactService.inspectJar({ jarPath: candidate.jarPath, workspacePath: selector.workspacePath });
@@ -242,7 +288,7 @@ export class JavaClassAnalyzerMCPServer {
         const result: any = { className: candidate.className, jarPath: candidate.jarPath, entryPath: classEntry.entryPath, origin: candidate.origin, backgroundSearchComplete: resolved.complete };
         if (view === 'source' || view === 'all') {
             await sendProgress?.('Loading source/decompiling class', 35, 100);
-            result.source = await this.loadClassSource(candidate, classEntry.entryPath, contextPath, args);
+            Object.assign(result, await this.loadClassSource(candidate, classEntry.entryPath, contextPath, args));
         }
         const normalEntryPath = `${candidate.className.replace(/\./g, '/')}.class`;
         const needsExtractedClass = classEntry.entryPath !== normalEntryPath;
@@ -251,10 +297,15 @@ export class JavaClassAnalyzerMCPServer {
             const bytes = await jarIndexer.readEntry(candidate.jarPath, classEntry.entryPath, 20 * 1024 * 1024);
             const classFileMetadata = ClassFileMetadataReader.read(bytes);
             if (needsExtractedClass) inspectionClassFile = await this.getInspectionClassFile(candidate, classEntry.entryPath, contextPath, bytes);
-            const summary = inspectionClassFile
-                ? await this.analyzer.analyzeClassFile(candidate.className, inspectionClassFile, contextPath)
-                : await this.analyzer.analyzeClassFromJar(candidate.className, candidate.jarPath, contextPath, true);
-            result.api = { summary, classFileMetadata };
+            const signatures = await this.analyzer.getSignatures(candidate.className, contextPath, inspectionClassFile ? { classFile: inspectionClassFile } : { jarPath: candidate.jarPath });
+            result.api = {
+                signatures: signatures.trim(),
+                superClass: classFileMetadata.superClass,
+                interfaces: classFileMetadata.interfaces,
+                accessFlags: classFileMetadata.accessFlags,
+                fields: classFileMetadata.fields,
+                methods: classFileMetadata.methods,
+            };
         }
         if (view === 'hierarchy' || view === 'all') result.hierarchy = await this.resolveHierarchy(candidate, selector, contextPath, classEntry.entryPath);
         if (view === 'bytecode' || view === 'all') {
@@ -289,7 +340,7 @@ export class JavaClassAnalyzerMCPServer {
 
     private async handleSearchResources(args: any) {
         const result = await artifactService.searchResources(await this.selectorFromArgs(args, true), args.pathQuery ?? '', args.contentQuery, this.clamp(args.limit, 1, 100, 20));
-        let text = result.results.length ? `Found ${result.results.length} resource(s):\n${result.results.map(item => `- ${item.resourcePath} -> ${item.jarPath}`).join('\n')}` : 'No matching resources found.';
+        let text = result.results.length ? `Found ${result.results.length} resource(s):\n${result.results.map(item => `- ${item.resourcePath} -> ${item.jarPath}${item.contentMatch ? `\n    ...${item.contentMatch.replace(/\s+/g, ' ').trim()}...` : ''}`).join('\n')}` : 'No matching resources found.';
         if (!result.complete) text += '\n\nResource search is partial.';
         if (result.errors.length) text += `\n${result.errors.map(error => `- ${error.jarPath ?? error.contextPath ?? 'workspace'}: ${error.message}`).join('\n')}`;
         return this.formatResponse(text, result, args.format);
@@ -301,43 +352,45 @@ export class JavaClassAnalyzerMCPServer {
         return this.formatResponse(`Resource ${result.resourcePath} (${result.startLine}-${result.endLine}/${result.totalLines}):\n\n${result.text}`, result, args.format);
     }
 
-    private async loadClassSource(candidate: ClassCandidate, entryPath: string, contextPath: string, args: any): Promise<string> {
+    private async loadClassSource(candidate: ClassCandidate, entryPath: string, contextPath: string, args: any): Promise<SourceSlice> {
         const sameJarIndex = await jarIndexer.getLightIndex(candidate.jarPath, contextPath);
         const embeddedSource = sameJarIndex.classes.find(item => item.className === candidate.className && item.isSource);
         if (embeddedSource) {
-            return this.sliceSource((await jarIndexer.readEntry(candidate.jarPath, embeddedSource.entryPath, 10 * 1024 * 1024)).toString('utf8'), args);
+            return { ...this.sliceSource((await jarIndexer.readEntry(candidate.jarPath, embeddedSource.entryPath, 10 * 1024 * 1024)).toString('utf8'), args), sourceOrigin: 'embedded-source' };
         }
         const sourceJar = candidate.jarPath.replace(/\.jar$/i, '-sources.jar');
-        if (await fs.pathExists(sourceJar)) {
+        if (sourceJar !== candidate.jarPath && await fs.pathExists(sourceJar)) {
             const sourceIndex = await jarIndexer.getLightIndex(sourceJar, contextPath);
             const sourceEntry = sourceIndex.classes.find(item => item.className === candidate.className && item.isSource);
-            if (sourceEntry) return this.sliceSource((await jarIndexer.readEntry(sourceJar, sourceEntry.entryPath, 10 * 1024 * 1024)).toString('utf8'), args);
+            if (sourceEntry) return { ...this.sliceSource((await jarIndexer.readEntry(sourceJar, sourceEntry.entryPath, 10 * 1024 * 1024)).toString('utf8'), args), sourceOrigin: 'sources-jar' };
         }
         const source = await this.decompiler.decompileClassFromJar(candidate.className, candidate.jarPath, contextPath, entryPath, args.useCache !== false);
-        return this.sliceSource(source, args);
+        return { ...this.sliceSource(source, args), sourceOrigin: 'decompiled' };
     }
 
-    private sliceSource(source: string, args: any): string {
+    private sliceSource(source: string, args: any): SourceSlice {
         if (args.methodName) {
             const extracted = extractMethod(source, args.methodName, args.paramTypes);
-            if (!extracted) throw new Error(`Method not found: ${args.methodName}`);
-            return extracted;
+            if (!extracted) throw new Error(`Method not found: ${args.methodName}${args.paramTypes ? `(${args.paramTypes.join(', ')})` : ''}. Use view=api to list the declared methods.`);
+            return { source: extracted };
         }
         const lines = source.split('\n');
+        const totalLines = lines.length;
         const offset = this.clamp(args.offset, 1, Number.MAX_SAFE_INTEGER, 1);
         const requestedLimit = Number(args.limit ?? 0);
-        if (offset === 1 && requestedLimit <= 0) return source;
-        const end = requestedLimit > 0 ? Math.min(lines.length, offset - 1 + requestedLimit) : lines.length;
-        return lines.slice(offset - 1, end).join('\n');
+        if (offset === 1 && !(requestedLimit > 0)) return { source };
+        if (offset > totalLines) throw new Error(`offset ${offset} is past the end of the source (${totalLines} lines).`);
+        const end = requestedLimit > 0 ? Math.min(totalLines, offset - 1 + requestedLimit) : totalLines;
+        return { source: lines.slice(offset - 1, end).join('\n'), sourceRange: { startLine: offset, endLine: end, totalLines } };
     }
 
     private async inspectJdkClass(className: string, contextPath: string, view: string, args: any): Promise<any> {
         const result: any = { className, origin: 'jdk' };
         if (view === 'source' || view === 'all') {
             const source = await jdkSourceService.getSource(className);
-            if (source) result.source = this.sliceSource(source, args); else result.sourceUnavailable = true;
+            if (source) Object.assign(result, this.sliceSource(source, args), { sourceOrigin: 'jdk-src.zip' }); else result.sourceUnavailable = true;
         }
-        if (view === 'api' || view === 'all' || view === 'hierarchy') result.api = await this.analyzer.analyzeJdkClass(className, contextPath);
+        if (view === 'api' || view === 'all') result.api = { signatures: (await this.analyzer.getSignatures(className, contextPath)).trim() };
         if (view === 'hierarchy' || view === 'all') result.hierarchy = await this.resolveJdkHierarchy(className, contextPath);
         if (view === 'bytecode' || view === 'all') result.bytecode = await this.analyzer.getBytecode(className, contextPath);
         return result;
@@ -350,7 +403,11 @@ export class JavaClassAnalyzerMCPServer {
         while (current && hierarchy.length < 20 && !visited.has(current)) {
             visited.add(current);
             hierarchy.push({ className: current, level: hierarchy.length, resolved: true });
-            try { current = (await this.analyzer.analyzeJdkClass(current, contextPath)).superClass; }
+            try {
+                const analysis = await this.analyzer.analyzeJdkClass(current, contextPath);
+                hierarchy[hierarchy.length - 1].interfaces = analysis.interfaces;
+                current = analysis.superClass;
+            }
             catch { hierarchy[hierarchy.length - 1].resolved = false; break; }
         }
         return hierarchy.reverse().map((entry, level) => ({ ...entry, level }));
@@ -372,7 +429,7 @@ export class JavaClassAnalyzerMCPServer {
                     analysis = { className: current, packageName: current.includes('.') ? current.substring(0, current.lastIndexOf('.')) : '', modifiers: [], superClass: metadata.superClass, interfaces: metadata.interfaces, fields: [], methods: [] };
                 } else if (currentJar) analysis = await this.analyzer.analyzeClassFromJar(current, currentJar, contextPath, false);
                 else throw new Error('unresolved');
-                chain.push({ className: current, level: chain.length, resolved: true });
+                chain.push({ className: current, level: chain.length, resolved: true, interfaces: analysis.interfaces });
                 const analyzedJar = currentJar;
                 current = analysis.superClass;
                 entryPath = undefined;
@@ -413,9 +470,12 @@ export class JavaClassAnalyzerMCPServer {
 
     private classInspectionText(className: string, result: any): string {
         let text = `Class inspection: ${className}\nOrigin: ${result.origin}${result.jarPath ? `\nJAR: ${result.jarPath}` : ''}`;
+        if (result.sourceOrigin) text += `\nSource origin: ${result.sourceOrigin === 'decompiled' ? 'decompiled with Vineflower (not original source; comments and local names may differ)' : result.sourceOrigin}`;
+        if (result.sourceRange) text += `\nLines: ${result.sourceRange.startLine}-${result.sourceRange.endLine} of ${result.sourceRange.totalLines}${result.sourceRange.endLine < result.sourceRange.totalLines ? ` (call again with offset=${result.sourceRange.endLine + 1} for more)` : ''}`;
+        if (result.sourceUnavailable) text += '\n\nSource: unavailable (JDK src.zip not found; use view=api or view=bytecode).';
         if (result.source) text += `\n\nSource:\n\n\`\`\`java\n${result.source}\n\`\`\``;
-        if (result.api) text += `\n\nAPI:\n${JSON.stringify(result.api, null, 2)}`;
-        if (result.hierarchy) text += `\n\nHierarchy:\n${result.hierarchy.map((item: HierarchyEntry) => `${'  '.repeat(item.level)}${item.className}${item.resolved ? '' : ' (unresolved)'}`).join('\n')}`;
+        if (result.api) text += `\n\nAPI (javap -p):\n\n\`\`\`text\n${result.api.signatures}\n\`\`\``;
+        if (result.hierarchy) text += `\n\nHierarchy (root first):\n${result.hierarchy.map((item: HierarchyEntry) => `${'  '.repeat(item.level)}${item.className}${item.resolved ? '' : ' (unresolved)'}${item.interfaces?.length ? ` implements ${item.interfaces.join(', ')}` : ''}`).join('\n')}`;
         if (result.bytecode) text += `\n\nBytecode:\n\n\`\`\`text\n${result.bytecode}\n\`\`\``;
         return text;
     }
@@ -458,10 +518,11 @@ export class JavaClassAnalyzerMCPServer {
         return this.formatResponse(text, structured, format);
     }
 
-    private formatResponse(text: string, structured: object, format: Format = 'text') {
-        if (format === 'json') return { content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }] };
-        if (format === 'toon') { try { return { content: [{ type: 'text', text: toonEncode(structured) }] }; } catch { return { content: [{ type: 'text', text }] }; } }
-        return { content: [{ type: 'text', text }] };
+    private formatResponse(text: string, structured: object, format: Format = 'text'): { content: Array<{ type: 'text'; text: string }> } {
+        const wrap = (value: string) => ({ content: [{ type: 'text' as const, text: value }] });
+        if (format === 'json') return wrap(JSON.stringify(structured, null, 2));
+        if (format === 'toon') { try { return wrap(toonEncode(structured)); } catch { return wrap(text); } }
+        return wrap(text);
     }
 
     private clamp(value: unknown, min: number, max: number, fallback: number): number {
@@ -485,36 +546,6 @@ export class JavaClassAnalyzerMCPServer {
         return resolved;
     }
 
-    private async validateProjectPath(projectPath: string): Promise<void> {
-        const resolved = await this.validateDirectory(projectPath, 'projectPath');
-        if (!(await fs.pathExists(path.join(resolved, 'pom.xml')))) throw new Error(`No pom.xml found in ${resolved}`);
-    }
-
-    private async ensureScanStarted(projectPath: string, sendProgress?: Progress): Promise<void> {
-        if (await this.scanner.isIndexComplete(projectPath)) return;
-        if (await this.scanner.getClasspath(projectPath)) return;
-        try { await this.scanner.scanProject(projectPath, false, sendProgress); }
-        catch (error) { throw new Error(`Unable to start dependency scan: ${error instanceof Error ? error.message : String(error)}`); }
-    }
-
-    private applyFilter(analysis: { fields: any[]; methods: any[] }, filter: string): { fields: any[]; methods: any[] } {
-        let fields = analysis.fields, methods = analysis.methods;
-        if (filter === 'fields') methods = [];
-        else if (filter === 'methods') fields = [];
-        else if (filter !== 'all') { fields = fields.filter(field => field.modifiers.includes(filter)); methods = methods.filter(method => method.modifiers.includes(filter)); }
-        return { fields, methods };
-    }
-
-    private getDebugEnv(): Record<string, string | undefined> {
-        return { NODE_ENV: process.env.NODE_ENV, JAVA_HOME: process.env.JAVA_HOME, MAVEN_HOME: process.env.MAVEN_HOME, MAVEN_CMD: process.env.MAVEN_CMD, MAVEN_REPO: process.env.MAVEN_REPO, DECOMPILER_PATH: process.env.DECOMPILER_PATH };
-    }
-
-    private logToolDebug(logger: Logger, toolName: string, projectPath: string, extra?: Record<string, unknown>): void {
-        if (process.env.NODE_ENV !== 'development') return;
-        logger.debug(`[TOOL:${toolName}] Context: projectPath=${projectPath}, serverVersion=${version}`);
-        if (extra) logger.debug(`[TOOL:${toolName}] Params: ${JSON.stringify(extra)}`);
-    }
-
     private async tryAutoScan(): Promise<void> {
         const workspacePath = process.cwd();
         const logger = Logger.get(workspacePath);
@@ -530,7 +561,7 @@ export class JavaClassAnalyzerMCPServer {
     }
 
     async run(): Promise<void> {
-        await this.server.connect(new StdioServerTransport());
+        await this.mcp.connect(new StdioServerTransport());
         Logger.get(process.cwd()).info(`[SERVER] java-inspector v${version} running; cwd=${process.cwd()}, node=${process.version}, pid=${process.pid}`);
         void this.tryAutoScan();
     }

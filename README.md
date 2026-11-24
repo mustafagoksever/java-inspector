@@ -6,7 +6,7 @@ The server starts accepting MCP calls immediately. Maven dependency scanning con
 
 ## Requirements
 
-- Node.js 16 or newer
+- Node.js 20 or newer
 - Java 17 or newer (`java` and `javap`); required by bundled Vineflower 1.11.2
 - Maven for Maven project discovery and dependency resolution
 

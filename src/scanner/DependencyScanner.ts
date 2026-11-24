@@ -84,7 +84,7 @@ export class DependencyScanner {
                 classCount: 0,
                 sampleEntries: [],
                 status: 'in_progress' as const,
-                message: `Previous scan failed: ${storedError}. Call scan_dependencies with forceRefresh=true to retry.`,
+                message: `Previous scan failed: ${storedError}. Call scan_project with forceRefresh=true to retry.`,
             };
         }
 
@@ -134,7 +134,7 @@ export class DependencyScanner {
                 classCount: 0,
                 sampleEntries: [],
                 status: 'in_progress',
-                message: 'Maven classpath is being resolved in the background. This may take a few minutes for large projects (e.g. Spring Boot). Call scan_dependencies again to check progress.',
+                message: 'Maven classpath is being resolved in the background. This may take a few minutes for large projects (e.g. Spring Boot). Call scan_project again to check progress; other tools already work on the partial index.',
             };
         }
 
@@ -190,7 +190,7 @@ export class DependencyScanner {
             classCount: 0,
             sampleEntries: [],
             status: 'in_progress',
-            message: 'Maven classpath resolution started in the background. This may take a few minutes for large projects (e.g. Spring Boot). Call scan_dependencies again to check progress.',
+            message: 'Maven classpath resolution started in the background. This may take a few minutes for large projects (e.g. Spring Boot). Call scan_project again to check progress; other tools already work on the partial index.',
         };
     }
 
@@ -291,7 +291,13 @@ export class DependencyScanner {
         const mavenCmd = await this.resolveMavenCommand(projectPath);
         const cacheDir = getProjectCacheDir(projectPath);
         await fs.ensureDir(cacheDir);
-        const outputFile = path.join(cacheDir, 'maven-cp.txt');
+        // One output file per reactor module. A single shared -Dmdep.outputFile is overwritten by every
+        // module of a multi-module build (only the last module would survive), and -Dmdep.appendOutput
+        // is not reliable across plugin versions. Maven interpolates ${project.*} in the CLI property.
+        const outputDir = path.join(cacheDir, 'maven-cp');
+        await fs.remove(outputDir).catch(() => {});
+        await fs.ensureDir(outputDir);
+        const outputFile = path.join(outputDir, 'cp-${project.groupId}__${project.artifactId}.txt');
 
         const isDebug = process.env.NODE_ENV === 'development';
 
@@ -303,7 +309,8 @@ export class DependencyScanner {
         try {
             const { stdout, stderr } = await execFileAsync(
                 mavenCmd,
-                ['dependency:build-classpath', `-Dmdep.outputFile=${outputFile}`, '-q'],
+                // -B: never block on interactive prompts.
+                ['-B', '-q', 'dependency:build-classpath', `-Dmdep.outputFile=${outputFile}`],
                 {
                     cwd: projectPath,
                     timeout: 300000, // 5 minutes for large projects (e.g. Spring Boot)
@@ -329,24 +336,22 @@ export class DependencyScanner {
             throw new Error(`Maven command failed: ${error.message}${details}`);
         }
 
-        if (!(await fs.pathExists(outputFile))) {
+        const outputFiles = (await fs.readdir(outputDir)).filter(name => name.endsWith('.txt')).sort();
+        if (outputFiles.length === 0) {
             throw new Error('Maven did not produce classpath output file');
         }
+        const contents: string[] = [];
+        for (const name of outputFiles) contents.push(await fs.readFile(path.join(outputDir, name), 'utf-8'));
+        await fs.remove(outputDir).catch(() => {});
 
-        const content = await fs.readFile(outputFile, 'utf-8');
-        // Remove the temp file
-        try {
-            await fs.remove(outputFile);
-        } catch {
-            // ignore cleanup errors
-        }
-
-        // Classpath entries are separated by path.delimiter (: on Unix, ; on Windows)
-        const jarPaths = content
-            .trim()
-            .split(path.delimiter)
+        // Classpath entries are separated by path.delimiter (: on Unix, ; on Windows); the same JAR
+        // usually appears in several modules.
+        const jarPaths = [...new Set(contents
+            .flatMap(content => content.split(/\r?\n/))
+            .flatMap(line => line.split(path.delimiter))
             .map(p => p.trim())
-            .filter(p => p.length > 0 && p.endsWith('.jar'));
+            .filter(p => p.length > 0 && p.endsWith('.jar')))];
+        logger.info(`[MAVEN] Read classpath of ${outputFiles.length} module(s).`);
 
         // Validate paths exist
         const validPaths: string[] = [];
@@ -423,7 +428,7 @@ export class DependencyScanner {
         const mavenCmd = await this.resolveMavenCommand(projectPath);
         const { stdout, stderr } = await execFileAsync(
             mavenCmd,
-            ['dependency:tree', `-Dincludes=${coordinates}`, '-Dverbose'],
+            ['-B', 'dependency:tree', `-Dincludes=${coordinates}`, '-Dverbose'],
             {
                 cwd: projectPath,
                 timeout: 120000,
