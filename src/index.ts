@@ -16,14 +16,14 @@ import { jarIndexer } from './scanner/JarIndexer.js';
 import { projectDiscovery } from './scanner/ProjectDiscovery.js';
 import { ClassFileMetadataReader } from './scanner/ClassFileMetadataReader.js';
 import { getResultCacheDir } from './utils/cachePaths.js';
-import { extractMethod } from './utils/methodExtractor.js';
+import { extractMethod, extractTypeDeclaration } from './utils/methodExtractor.js';
 import { Logger } from './utils/Logger.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const { version } = JSON.parse(readFileSync(path.resolve(__dirname, '../package.json'), 'utf-8'));
 type Format = 'text' | 'json' | 'toon';
-type SourceSlice = { source: string; sourceRange?: { startLine: number; endLine: number; totalLines: number }; sourceOrigin?: 'embedded-source' | 'sources-jar' | 'decompiled' | 'jdk-src.zip' };
+type SourceSlice = { source: string; sourceRange?: { startLine: number; endLine: number; totalLines: number }; sourceOrigin?: 'embedded-source' | 'sources-jar' | 'decompiled' | 'jdk-src.zip'; enclosingClass?: string; sourceNote?: string };
 type Progress = (message: string, progress?: number, total?: number) => Promise<void>;
 
 /**
@@ -35,10 +35,10 @@ export const SERVER_INSTRUCTIONS = `java-inspector gives read-only access to com
 
 Prefer these tools over shell commands for anything inside a JAR or the JDK:
 - Instead of \`javap\` / \`javap -c\` / \`javap -p\`: inspect_class with view "api" (signatures) or "bytecode".
-- Instead of decompiling by hand or guessing library behaviour: inspect_class with view "source" (uses -sources.jar when present, otherwise Vineflower). Pass methodName to get a single method.
+- Instead of decompiling by hand or guessing library behaviour: inspect_class with view "source" (uses -sources.jar when present, otherwise Vineflower). Pass methodName to get a single method; nested classes are addressed as Outer$Inner.
 - For classes from the project's Maven dependencies, pass only className (fully qualified). Do NOT look up the JAR in ~/.m2 or pass jarPath first: the server knows the project classpath and finds the JAR itself, waiting for Maven if the project is opened for the first time.
 - Instead of \`unzip -l\`, \`jar tf\`, \`find ~/.m2 -name\`, \`grep -r\` over JARs: search_class, find_jar, inspect_jar, search_resources, read_resource.
-- Instead of \`mvn dependency:tree\`: explain_dependency.
+- Instead of \`mvn dependency:tree\`: explain_dependency. For version conflicts / the same class in several JARs (NoSuchMethodError, ClassCastException): find_duplicates.
 - To find who implements an interface or calls/declares a member or uses a string: find_implementations / search_code.
 
 Workflow: inspect_class with the fully qualified name; if you only know the simple name, search_class first. No scan is required first: the Maven classpath is resolved in the background at startup and tools return partial results with complete=false instead of waiting. When a result is ambiguous, the response lists candidates; repeat the call with jarPath set to one of them. All paths must be absolute.`;
@@ -132,12 +132,26 @@ export class JavaClassAnalyzerMCPServer {
             { className: z.string().describe('Fully qualified name of the interface or superclass, e.g. "org.springframework.core.convert.converter.Converter".'), ...SELECTOR, transitive: z.boolean().default(true).describe('Include indirect subtypes (subclass of an implementation, sub-interfaces).'), mode: MODE, limit: num('Max results (1-200, default 50).'), format: FORMAT },
             (args, progress) => this.handleFindImplementations(args, progress));
 
+        register('find_duplicates', 'Find duplicate classes',
+            'List classes that exist in more than one JAR of the Maven classpath: the same artifact in two versions, split packages, or shaded/relocated copies (typical causes of NoSuchMethodError, ClassCastException, "works in IDE, fails in prod"). ' +
+            'Groups duplicates by the set of JARs that share them, with Maven coordinates, class counts and sample classes. Use instead of comparing `jar tf` listings by hand; then explain_dependency tells why each JAR is on the classpath. ' +
+            'complete=false means some JARs were not indexed yet; call again.',
+            {
+                ...SELECTOR,
+                query: z.string().optional().describe('Only report duplicate classes whose fully qualified name contains this (case-insensitive), e.g. "org.slf4j" or "Logger".'),
+                limit: num('Max JAR groups (1-200, default 30).'),
+                classLimit: num('Sample classes listed per group (1-100, default 10).'),
+                mode: MODE,
+                format: FORMAT,
+            },
+            (args, progress) => this.handleFindDuplicates(args, progress));
+
         register('inspect_class', 'Inspect / decompile class',
-            'Show a Java class from a Maven dependency, local JAR, or the JDK. view="source": real source from a -sources.jar if present, otherwise decompiled with Vineflower (inner classes included); pass methodName (and optionally paramTypes) to return a single method, or offset/limit to page large files. ' +
+            'Show a Java class from a Maven dependency, local JAR, or the JDK. view="source": real source from a -sources.jar if present, otherwise decompiled with Vineflower (nested classes included; ask for Outer$Inner to get only one nested class); pass methodName (and optionally paramTypes) to return a single method, or offset/limit to page large files. ' +
             'view="api": compact member signatures (replaces `javap -p`). view="bytecode": `javap -c -l -p -s` output. view="hierarchy": superclass chain and interfaces. view="all": everything. ' +
             'Use this instead of running javap or a decompiler in the shell. For Maven dependencies pass ONLY className: the JAR is found from the project classpath (no need to locate it in ~/.m2). jarPath/jarDirectory are for non-Maven JARs or to pick one of several candidates. Use search_class first if you only know the simple name.',
             {
-                className: z.string().describe('Fully qualified class name, e.g. "com.fasterxml.jackson.databind.ObjectMapper". Nested classes are included in the outer class source view.'),
+                className: z.string().describe('Fully qualified class name, e.g. "com.fasterxml.jackson.databind.ObjectMapper". Nested classes: "com.acme.Outer$Inner" (or "com.acme.Outer.Inner"); view=source then returns just the nested declaration.'),
                 ...SELECTOR,
                 view: z.enum(['source', 'api', 'hierarchy', 'bytecode', 'all']).default('source').describe('Which view to return.'),
                 methodName: z.string().optional().describe('view=source only: return just this method (all overloads unless paramTypes is given).'),
@@ -252,6 +266,35 @@ export class JavaClassAnalyzerMCPServer {
         return this.formatResponse(text, result, args.format);
     }
 
+    private async handleFindDuplicates(args: any, sendProgress?: Progress) {
+        const selector = await this.selectorFromArgs(args, true);
+        await sendProgress?.('Collecting classpath class index', 0, 100);
+        const result = await artifactService.findDuplicateClasses(
+            { ...selector, classpathWaitMs: args.mode === 'fast' ? 0 : 60_000, onWait: message => sendProgress?.(message, 10, 100) ?? Promise.resolve() },
+            {
+                query: args.query,
+                limit: this.clamp(args.limit, 1, 200, 30),
+                classLimit: this.clamp(args.classLimit, 1, 100, 10),
+                maxNewJars: args.mode === 'fast' ? 50 : 500,
+                deadlineMs: args.mode === 'fast' ? 5_000 : 25_000,
+            },
+        );
+        const describeJar = (jar: { jarPath: string; groupId?: string; artifactId?: string; version?: string }) =>
+            jar.artifactId ? `${jar.groupId ?? '?'}:${jar.artifactId}:${jar.version} (${jar.jarPath})` : jar.jarPath;
+        let text = result.groups.length
+            ? `Found ${result.totalDuplicateClasses} duplicate class(es) in ${result.totalGroups} JAR group(s)${result.groups.length < result.totalGroups ? ` (showing ${result.groups.length})` : ''}:\n\n` +
+              result.groups.map((group, index) => [
+                  `${index + 1}. ${group.kind === 'same-artifact-multiple-versions' ? 'Same artifact, multiple versions' : 'Different artifacts'} - ${group.classCount} class(es)`,
+                  ...group.jars.map(jar => `   - ${describeJar(jar)}`),
+                  `   Packages: ${group.packages.join(', ') || '(default)'}`,
+                  `   Classes: ${group.sampleClasses.join(', ')}${group.classCount > group.sampleClasses.length ? ', ...' : ''}`,
+              ].join('\n')).join('\n\n')
+            : `No duplicate classes found${args.query ? ` matching "${args.query}"` : ''}${result.complete ? '.' : ' in the JARs indexed so far.'}`;
+        if (!result.complete) text += `\n\nResult is partial${result.remainingJarCount ? `; ${result.remainingJarCount} JAR(s) not indexed yet` : ''}. Call again to continue.`;
+        if (result.errors.length) text += `\n${result.errors.map(error => `- ${error.jarPath ?? error.contextPath ?? 'workspace'}: ${error.message}`).join('\n')}`;
+        return this.formatResponse(text, result, args.format);
+    }
+
     private async handleInspectClass(args: any, sendProgress?: Progress) {
         this.validateClassName(args.className);
         const selector = await this.selectorFromArgs(args, true);
@@ -269,11 +312,18 @@ export class JavaClassAnalyzerMCPServer {
             classpathWaitMs: 90_000,
             onWait: message => sendProgress?.(message, 10, 100) ?? Promise.resolve(),
         });
-        const requested = String(args.className);
+        let requested = String(args.className);
         const isQualified = requested.includes('.');
         // Never fall back to fuzzy matches here: silently decompiling "FooBar" when "Foo" was asked is worse than an error.
-        const exact = resolved.results.filter(item => isQualified ? item.className === requested : item.simpleName === requested);
-        const unique = this.uniqueClassCandidates(exact);
+        const exactMatches = (result: typeof resolved, name: string) => this.uniqueClassCandidates(result.results.filter(item => isQualified ? item.className === name : item.simpleName === name));
+        let unique = exactMatches(resolved, requested);
+        const binaryName = unique.length ? undefined : this.nestedBinaryName(requested);
+        if (binaryName) {
+            // Source-style nested name (java.util.Map.Entry style): retry as the binary name Outer$Inner.
+            const retry = await artifactService.resolveClass(binaryName, { ...selector, classpathWaitMs: 90_000 });
+            const retryUnique = exactMatches(retry, binaryName);
+            if (retryUnique.length) { unique = retryUnique; requested = binaryName; }
+        }
         if (!unique.length) {
             const suggestions = this.uniqueClassCandidates(resolved.results).slice(0, 10).map(item => `- ${item.className} -> ${item.jarPath}`);
             const partial = resolved.complete ? '' : (resolved.results.length === 0 && resolved.scannedJarCount === 0
@@ -363,19 +413,40 @@ export class JavaClassAnalyzerMCPServer {
     }
 
     private async loadClassSource(candidate: ClassCandidate, entryPath: string, contextPath: string, args: any): Promise<SourceSlice> {
+        const dollar = candidate.className.indexOf('$', candidate.className.lastIndexOf('.') + 1);
+        if (dollar < 0) {
+            const raw = await this.loadRawSource(candidate, entryPath, contextPath, args);
+            return { ...this.sliceSource(raw.source, args), sourceOrigin: raw.sourceOrigin };
+        }
+        // Nested class: sources and Vineflower output live in the top-level class; cut out the nested declaration.
+        const outerClassName = candidate.className.substring(0, dollar);
+        const outerEntryPath = entryPath.replace(/\$[^/]*(\.class|\.java)$/i, '$1');
+        const raw = await this.loadRawSource({ ...candidate, className: outerClassName }, outerEntryPath, contextPath, args);
+        const names = candidate.className.substring(dollar + 1).split('$');
+        const nested = extractTypeDeclaration(raw.source, names);
+        if (nested) return { ...this.sliceSource(nested, args), sourceOrigin: raw.sourceOrigin, enclosingClass: outerClassName };
+        return {
+            ...this.sliceSource(raw.source, args),
+            sourceOrigin: raw.sourceOrigin,
+            enclosingClass: outerClassName,
+            sourceNote: `${candidate.className} is an anonymous/local or synthetic class; showing the source of ${outerClassName}. Use view=bytecode for its exact code.`,
+        };
+    }
+
+    private async loadRawSource(candidate: ClassCandidate, entryPath: string, contextPath: string, args: any): Promise<{ source: string; sourceOrigin: NonNullable<SourceSlice['sourceOrigin']> }> {
         const sameJarIndex = await jarIndexer.getLightIndex(candidate.jarPath, contextPath);
         const embeddedSource = sameJarIndex.classes.find(item => item.className === candidate.className && item.isSource);
         if (embeddedSource) {
-            return { ...this.sliceSource((await jarIndexer.readEntry(candidate.jarPath, embeddedSource.entryPath, 10 * 1024 * 1024)).toString('utf8'), args), sourceOrigin: 'embedded-source' };
+            return { source: (await jarIndexer.readEntry(candidate.jarPath, embeddedSource.entryPath, 10 * 1024 * 1024)).toString('utf8'), sourceOrigin: 'embedded-source' };
         }
         const sourceJar = candidate.jarPath.replace(/\.jar$/i, '-sources.jar');
         if (sourceJar !== candidate.jarPath && await fs.pathExists(sourceJar)) {
             const sourceIndex = await jarIndexer.getLightIndex(sourceJar, contextPath);
             const sourceEntry = sourceIndex.classes.find(item => item.className === candidate.className && item.isSource);
-            if (sourceEntry) return { ...this.sliceSource((await jarIndexer.readEntry(sourceJar, sourceEntry.entryPath, 10 * 1024 * 1024)).toString('utf8'), args), sourceOrigin: 'sources-jar' };
+            if (sourceEntry) return { source: (await jarIndexer.readEntry(sourceJar, sourceEntry.entryPath, 10 * 1024 * 1024)).toString('utf8'), sourceOrigin: 'sources-jar' };
         }
         const source = await this.decompiler.decompileClassFromJar(candidate.className, candidate.jarPath, contextPath, entryPath, args.useCache !== false);
-        return { ...this.sliceSource(source, args), sourceOrigin: 'decompiled' };
+        return { source, sourceOrigin: 'decompiled' };
     }
 
     private sliceSource(source: string, args: any): SourceSlice {
@@ -397,8 +468,12 @@ export class JavaClassAnalyzerMCPServer {
     private async inspectJdkClass(className: string, contextPath: string, view: string, args: any): Promise<any> {
         const result: any = { className, origin: 'jdk' };
         if (view === 'source' || view === 'all') {
-            const source = await jdkSourceService.getSource(className);
-            if (source) Object.assign(result, this.sliceSource(source, args), { sourceOrigin: 'jdk-src.zip' }); else result.sourceUnavailable = true;
+            const dollar = className.indexOf('$');
+            const outerName = dollar > 0 ? className.substring(0, dollar) : className;
+            const outerSource = await jdkSourceService.getSource(outerName);
+            const nested = outerSource && dollar > 0 ? extractTypeDeclaration(outerSource, className.substring(dollar + 1).split('$')) : null;
+            const source = nested ?? outerSource;
+            if (source) Object.assign(result, this.sliceSource(source, args), { sourceOrigin: 'jdk-src.zip' }, dollar > 0 ? { enclosingClass: outerName } : {}); else result.sourceUnavailable = true;
         }
         if (view === 'api' || view === 'all') result.api = { signatures: (await this.analyzer.getSignatures(className, contextPath)).trim() };
         if (view === 'hierarchy' || view === 'all') result.hierarchy = await this.resolveJdkHierarchy(className, contextPath);
@@ -481,6 +556,8 @@ export class JavaClassAnalyzerMCPServer {
     private classInspectionText(className: string, result: any): string {
         let text = `Class inspection: ${className}\nOrigin: ${result.origin}${result.jarPath ? `\nJAR: ${result.jarPath}` : ''}`;
         if (result.sourceOrigin) text += `\nSource origin: ${result.sourceOrigin === 'decompiled' ? 'decompiled with Vineflower (not original source; comments and local names may differ)' : result.sourceOrigin}`;
+        if (result.enclosingClass) text += `\nEnclosing class: ${result.enclosingClass}`;
+        if (result.sourceNote) text += `\nNote: ${result.sourceNote}`;
         if (result.sourceRange) text += `\nLines: ${result.sourceRange.startLine}-${result.sourceRange.endLine} of ${result.sourceRange.totalLines}${result.sourceRange.endLine < result.sourceRange.totalLines ? ` (call again with offset=${result.sourceRange.endLine + 1} for more)` : ''}`;
         if (result.sourceUnavailable) text += '\n\nSource: unavailable (JDK src.zip not found; use view=api or view=bytecode).';
         if (result.source) text += `\n\nSource:\n\n\`\`\`java\n${result.source}\n\`\`\``;
@@ -488,6 +565,15 @@ export class JavaClassAnalyzerMCPServer {
         if (result.hierarchy) text += `\n\nHierarchy (root first):\n${result.hierarchy.map((item: HierarchyEntry) => `${'  '.repeat(item.level)}${item.className}${item.resolved ? '' : ' (unresolved)'}${item.interfaces?.length ? ` implements ${item.interfaces.join(', ')}` : ''}`).join('\n')}`;
         if (result.bytecode) text += `\n\nBytecode:\n\n\`\`\`text\n${result.bytecode}\n\`\`\``;
         return text;
+    }
+
+    /** "com.acme.Outer.Inner" -> "com.acme.Outer$Inner" (first capitalised segment that is not the last starts the nesting). */
+    private nestedBinaryName(className: string): string | undefined {
+        if (className.includes('$')) return undefined;
+        const segments = className.split('.');
+        const outer = segments.findIndex((segment, index) => index < segments.length - 1 && /^[A-Z]/.test(segment));
+        if (outer < 0) return undefined;
+        return `${segments.slice(0, outer + 1).join('.')}$${segments.slice(outer + 1).join('$')}`;
     }
 
     private uniqueClassCandidates(candidates: ClassCandidate[]): ClassCandidate[] {

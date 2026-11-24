@@ -102,6 +102,72 @@ describe('ArtifactService', () => {
         expect((service as any).packageRelevance('StringUtils')(lang)).toBe(0);
     });
 
+    it('resolves nested classes through the outer class and suggests siblings on a miss', async () => {
+        const nested = await service.resolveClass('org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler$SaveType', { jarPath });
+        expect(nested.results[0]).toMatchObject({
+            className: 'org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler$SaveType',
+            entryPath: 'org/jetbrains/java/decompiler/main/decompiler/ConsoleDecompiler$SaveType.class',
+            jarPath,
+        });
+        const simple = await service.searchClasses('ConsoleDecompiler$SaveType', { jarPath }, 20, 5);
+        expect(simple.results[0].className).toBe('org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler$SaveType');
+        const miss = await service.resolveClass('org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler$Missing', { jarPath });
+        expect(miss.results.map(item => item.className)).toContain('org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler$SaveType');
+    });
+
+    it('orders deep-search JARs: deep-indexed first, then by package relevance', async () => {
+        const repo = '/home/u/.m2/repository';
+        const jars = [
+            `${repo}/org/slf4j/slf4j-api/2.0.13/slf4j-api-2.0.13.jar`,
+            `${repo}/org/springframework/spring-core/6.1.0/spring-core-6.1.0.jar`,
+            `${repo}/org/springframework/spring-context/6.1.0/spring-context-6.1.0.jar`,
+        ].map(jar => ({ jarPath: jar, jarName: path.basename(jar), origin: 'maven' as const, contextPath: '/w' }));
+        const { jarIndexer } = await import('./JarIndexer.js');
+        const deep = jest.spyOn(jarIndexer, 'hasDeepIndex').mockImplementation(async jar => jar.includes('slf4j'));
+        try {
+            const ordered = await (service as any).orderForDeepSearch(jars, { workspacePath: '/w' }, 'org.springframework.context.ApplicationListener');
+            expect(ordered.map((item: any) => path.basename(item.candidate.jarPath))).toEqual([
+                'slf4j-api-2.0.13.jar',
+                'spring-context-6.1.0.jar',
+                'spring-core-6.1.0.jar',
+            ]);
+        } finally {
+            deep.mockRestore();
+        }
+    });
+
+    it('finds classes duplicated across JARs and groups them by artifact', async () => {
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'java-inspector-dups-'));
+        const makeJar = async (target: string, names: string[]) => {
+            fs.mkdirSync(path.dirname(target), { recursive: true });
+            const output = fs.createWriteStream(target);
+            const archive = archiver('zip');
+            const done = new Promise<void>((resolve, reject) => { output.on('close', resolve); archive.on('error', reject); });
+            archive.pipe(output);
+            for (const name of names) archive.append(Buffer.from([0xca, 0xfe, 0xba, 0xbe]), { name });
+            archive.finalize();
+            await done;
+        };
+        try {
+            const repo = path.join(root, 'repository');
+            await makeJar(path.join(repo, 'org/demo/demo-lib/1.0/demo-lib-1.0.jar'), ['org/demo/Api.class', 'org/demo/Api$Inner.class', 'org/demo/Old.class']);
+            await makeJar(path.join(repo, 'org/demo/demo-lib/2.0/demo-lib-2.0.jar'), ['org/demo/Api.class', 'org/demo/Api$Inner.class', 'org/demo/New.class']);
+            await makeJar(path.join(repo, 'com/other/shaded/1.0/shaded-1.0.jar'), ['org/demo/Api.class', 'com/other/Own.class']);
+            const result = await service.findDuplicateClasses({ jarDirectory: repo });
+            expect(result.complete).toBe(true);
+            expect(result.totalDuplicateClasses).toBe(1);
+            expect(result.groups).toHaveLength(1);
+            expect(result.groups[0]).toMatchObject({ kind: 'different-artifacts', classCount: 1, sampleClasses: ['org.demo.Api'] });
+            expect(result.groups[0].jars.map(jar => `${jar.groupId}:${jar.artifactId}:${jar.version}`)).toEqual([
+                'com.other:shaded:1.0', 'org.demo:demo-lib:1.0', 'org.demo:demo-lib:2.0',
+            ]);
+            const filtered = await service.findDuplicateClasses({ jarDirectory: repo }, { query: 'com.other' });
+            expect(filtered.groups).toEqual([]);
+        } finally {
+            fs.rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it('does not append foreground scans to the project JSONL index', async () => {
         const append = jest.spyOn(projectCache, 'appendToClassIndex');
         try {

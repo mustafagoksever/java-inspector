@@ -61,7 +61,8 @@ Local, non-Maven JARs are not scanned at startup. They are found and indexed onl
 | `search_class` | Search the live partial index and foreground-scan relevant JARs on a miss. |
 | `search_code` | Search methods, fields, annotations, references, or string constants without mass decompilation. |
 | `find_implementations` | Find direct or transitive implementations/subtypes from lazy deep indexes. |
-| `inspect_class` | Return source, API, hierarchy, bytecode, or all views for a class. |
+| `find_duplicates` | List classes present in more than one classpath JAR (two versions of one artifact, split packages, shaded copies). |
+| `inspect_class` | Return source, API, hierarchy, bytecode, or all views for a class. Nested classes: `Outer$Inner`. |
 | `explain_dependency` | Run a filtered Maven dependency tree for a selected artifact. |
 | `search_resources` | Search resource paths or bounded text content. |
 | `read_resource` | Read an exact text resource with line pagination. |

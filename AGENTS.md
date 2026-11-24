@@ -22,7 +22,7 @@ TypeScript MCP server that decompiles Java classes from Maven dependencies using
 
 | File | Role |
 |------|------|
-| `src/index.ts` | MCP server (`JavaClassAnalyzerMCPServer`, built on `McpServer.registerTool`). Exposes 10 read-only tools: `scan_project`, `find_jar`, `inspect_jar`, `search_class`, `search_code`, `find_implementations`, `inspect_class`, `explain_dependency`, `search_resources`, `read_resource`. `SERVER_INSTRUCTIONS` is sent to clients on initialize. |
+| `src/index.ts` | MCP server (`JavaClassAnalyzerMCPServer`, built on `McpServer.registerTool`). Exposes 11 read-only tools: `scan_project`, `find_jar`, `inspect_jar`, `search_class`, `search_code`, `find_implementations`, `find_duplicates`, `inspect_class`, `explain_dependency`, `search_resources`, `read_resource`. `SERVER_INSTRUCTIONS` is sent to clients on initialize. |
 | `src/cli.ts` | Commander CLI. Default action (no args) starts the MCP server |
 | `src/cache/ProjectCache.ts` | Cache I/O: JSONL append-only persistence, in-memory `Map` index, pom/classpath hash validation, **cross-process file locking** via `proper-lockfile` |
 | `src/scanner/DependencyScanner.ts` | Runs `mvn -B dependency:build-classpath` with one output file per reactor module (`cp-${project.groupId}__${project.artifactId}.txt`), merges and de-duplicates JAR paths. Singleton. Integrates BackgroundScanner + LazyResolver |
@@ -32,7 +32,7 @@ TypeScript MCP server that decompiles Java classes from Maven dependencies using
 | `src/scanner/LazyResolver.ts` | On-demand class resolution: O(1) memory lookup, parallel JAR search on cache miss |
 | `src/decompiler/DecompilerService.ts` | Extracts `Outer.class` **and all `Outer$*.class`** from the JAR (via `yauzl`), runs Vineflower (`java -jar vineflower.jar -e=<jar> <classes...> <outdir>`). Reads generated `.java` from output dir and cleans up temp files |
 | `src/analyzer/JavaClassAnalyzer.ts` | Runs `javap` (`-p` signatures for the API view, `-c -l -p -s` for bytecode, `-v` parsing for hierarchy) |
-| `src/utils/methodExtractor.ts` | Extracts a single method body from decompiled source via regex + brace matching. Handles strings, line/block comments, nested braces, and abstract methods. |
+| `src/utils/methodExtractor.ts` | Extracts a single method body from decompiled source via regex + brace matching. Handles strings, line/block comments, nested braces, and abstract methods. `extractTypeDeclaration` cuts a nested type (`Outer$Inner`) out of the outer class source. |
 | `src/utils/cachePaths.ts` | Cache lives under **`~/.cache/java-inspector/<project>_<hash>/`** |
 
 ## Build & module system
@@ -152,18 +152,24 @@ After the transport connects, top-level `pom.xml` directories under `cwd` are di
 - For Maven dependencies only `className` is needed; the JAR comes from the project classpath. On a cold start (classpath not resolved yet) the lookup waits up to 90 s for Maven (`DependencyScanner.waitForClasspath`, progress notifications sent) instead of failing; `search_class` waits up to 30 s in `balanced` mode. While the background index is incomplete, JARs whose Maven path matches the package (`ArtifactService.packageRelevance`) are opened first.
 - Requires an **exact** class name match (FQN, or simple name if unique). Never falls back to fuzzy matches; on a miss it errors with similar class suggestions.
 - `view=source`: embedded `.java` → `*-sources.jar` → Vineflower. Response states the source origin. `methodName`/`paramTypes` extract one method; `offset`/`limit` page lines and the response reports `Lines: x-y of N`.
+- Nested classes: `Outer$Inner` (binary name) or `Outer.Inner` (source-style, retried as `Outer$Inner`). Resolution goes through the outer class (`ArtifactService.searchNestedClasses`), because the index skips inner classes. `view=source` loads the outer source and returns only the nested declaration (`Enclosing class:` in the response); anonymous classes (`Outer$1`) fall back to the full outer source with a note. api/bytecode/hierarchy run on the nested `.class` itself.
 - `view=api`: `javap -p` output (plus class-file metadata in `json` format).
 - `view=hierarchy`: superclass chain with interfaces per level.
 - `view=bytecode`: `javap -c -l -p -s`.
 
 ### `search_class` / `search_code` / `find_implementations` / `search_resources`
 - Use the live in-memory index first, then open unindexed JARs on demand within a per-call budget; `complete: false` + `remainingJarCount` tell the agent to call again or narrow with `jarNamePrefix`/`jarPath`.
+- `search_code` / `find_implementations` order JARs with `orderForDeepSearch`: already deep-indexed JARs first (free), then by `packageRelevance` of the target class / reference owner, so the new-JAR budget goes to the likeliest artifacts.
+
+### `find_duplicates`
+- Classes present in more than one classpath JAR, grouped by the JAR set that shares them, with coordinates parsed from the `~/.m2` layout. `kind` is `same-artifact-multiple-versions` or `different-artifacts` (split package / shaded copy); same-artifact groups sort first.
+- Uses the background class index (`getAllEntriesWithDuplicates`) and light-scans JARs not processed yet (fast: 50 JARs / 5 s, balanced: 500 JARs / 25 s). Inner classes are ignored (they follow their outer class).
 
 ## Gotchas
 - Jest config is `jest.config.js` (ts-jest ESM). Every module has a `*.test.ts` next to it.
 - The scanner uses `mvn dependency:build-classpath`, not `dependency:tree`. No regex parsing.
 - `yauzl` is used for ZIP/JAR reading (streams, lazy entries). Be careful with resource leaks; the code already ignores close errors in catch blocks.
-- Inner classes (`$` in filename) are intentionally skipped during index building.
+- Inner classes (`$` in filename) are intentionally skipped during index building; `Outer$Inner` lookups resolve the outer class and then read the JAR's light index.
 - Gradle is **not** supported; only Maven.
 - Brute-force fallback (`~/.m2/repository` recursive scan) has been **removed**. If Maven fails, the tool returns an error.
 - Cross-process locking (`proper-lockfile`) uses `mkdir` strategy which works on all platforms including network filesystems.

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `find_duplicates` tool: classes that exist in more than one classpath JAR, grouped by JAR set with Maven coordinates, flagged as `same-artifact-multiple-versions` or `different-artifacts` (split packages, shaded copies). Helps with NoSuchMethodError / ClassCastException investigations.
+- `inspect_class` and `search_class` accept nested classes (`com.acme.Outer$Inner`, or source-style `com.acme.Outer.Inner`). `view: "source"` returns just the nested declaration from the outer class source; api/bytecode/hierarchy use the nested class file.
+- `search_code` and `find_implementations` open already deep-indexed JARs first and then JARs whose Maven path matches the target package, so large projects need fewer calls.
+
 ### Changed
 
 - Bundled Vineflower updated from 1.11.2 to 1.12.0 (`lib/vineflower-1.12.0.jar`, requires Java 17+ like before). The decompile cache key now includes the decompiler version and extraction scheme, so cached output from older runs is not reused.

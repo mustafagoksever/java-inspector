@@ -69,6 +69,26 @@ export interface CodeSearchMatch {
     value?: string;
 }
 
+export interface DuplicateClassGroup {
+    contextPath: string;
+    jars: Array<{ jarPath: string; groupId?: string; artifactId?: string; version?: string }>;
+    /** same-artifact-multiple-versions: one groupId:artifactId on the classpath twice; different-artifacts: split package / shaded or relocated copy. */
+    kind: 'same-artifact-multiple-versions' | 'different-artifacts';
+    classCount: number;
+    packages: string[];
+    sampleClasses: string[];
+}
+
+export interface DuplicateClassesResult {
+    groups: DuplicateClassGroup[];
+    totalGroups: number;
+    totalDuplicateClasses: number;
+    complete: boolean;
+    scannedJarCount: number;
+    remainingJarCount: number;
+    errors: ArtifactScanError[];
+}
+
 export class ArtifactService {
     constructor(private readonly scanner: DependencyScanner = DependencyScanner.getInstance()) {}
 
@@ -188,6 +208,8 @@ export class ArtifactService {
         limit: number = 20,
         maxNewJars: number = 20,
     ): Promise<ClassSearchResult> {
+        const dollar = query.indexOf('$');
+        if (dollar > 0 && !/\s/.test(query.trim())) return this.searchNestedClasses(query.trim(), dollar, selector, limit, maxNewJars);
         const results = new Map<string, ClassCandidate>();
         const useWorkspaceClasspath = Boolean(selector.workspacePath && !selector.jarPath && !selector.jarDirectory && !selector.coordinates);
         const contexts = useWorkspaceClasspath ? await this.getContextPaths(selector.workspacePath!) : [];
@@ -312,6 +334,46 @@ export class ArtifactService {
         };
     }
 
+    /**
+     * Nested classes (Outer$Inner) are not part of the class index; resolve the outer class first,
+     * then read the nested entry from the outer class's JAR. On a miss the outer class's nested
+     * classes are returned as candidates so the caller can suggest them.
+     */
+    private async searchNestedClasses(query: string, dollar: number, selector: ArtifactSelector, limit: number, maxNewJars: number): Promise<ClassSearchResult> {
+        const outerName = query.substring(0, dollar);
+        const outer = await this.searchClasses(outerName, selector, 50, maxNewJars);
+        const qualified = outerName.includes('.');
+        const outerMatches = outer.results.filter(item => qualified ? item.className === outerName : item.simpleName === outerName);
+        const lower = query.toLowerCase();
+        const exact: ClassCandidate[] = [];
+        const related: ClassCandidate[] = [];
+        const errors = [...outer.errors];
+        const seen = new Set<string>();
+        for (const match of outerMatches) {
+            const jarKey = path.resolve(match.jarPath);
+            if (seen.has(jarKey)) continue;
+            seen.add(jarKey);
+            try {
+                const index = await jarScanCoordinator.scanLight(match.jarPath, match.contextPath, 'foreground');
+                const prefix = `${match.className}$`;
+                for (const entry of index.classes) {
+                    if (!entry.isInner || !entry.className.startsWith(prefix)) continue;
+                    const full = entry.className.toLowerCase();
+                    const simple = entry.simpleName.toLowerCase();
+                    const candidate: ClassCandidate = { ...entry, jarPath: match.jarPath, origin: match.origin, contextPath: match.contextPath, score: 0 };
+                    if (full === lower || simple === lower) exact.push({ ...candidate, score: full === lower ? 120 : 110 });
+                    else related.push({ ...candidate, score: full.includes(lower) || simple.includes(lower) ? 70 : 30 });
+                }
+            } catch (error) {
+                errors.push({ jarPath: match.jarPath, contextPath: match.contextPath, message: this.errorMessage(error) });
+            }
+        }
+        const byName = (a: ClassCandidate, b: ClassCandidate) => b.score - a.score || a.className.localeCompare(b.className);
+        const unique = (items: ClassCandidate[]) => [...new Map(items.map(item => [`${item.className}::${path.resolve(item.jarPath)}`, item])).values()];
+        const results = (exact.length ? unique(exact) : unique(related)).sort(byName).slice(0, Math.max(1, limit));
+        return { ...outer, query, results, errors, complete: outer.complete && errors.length === outer.errors.length };
+    }
+
     async resolveClass(className: string, selector: ArtifactSelector): Promise<ClassSearchResult> {
         // A fully qualified lookup is cheap with package-relevance ordering, so allow more JARs.
         return this.searchClasses(className, selector, 50, className.includes('.') ? 60 : 20);
@@ -332,10 +394,9 @@ export class ArtifactService {
         let remainingUnindexed = 0;
         let skippedAfterLimit = 0;
         const lower = query.toLowerCase();
+        const ordered = await this.orderForDeepSearch(jars, selector, kind === 'reference' ? query.split('#')[0] : query);
 
-        for (const candidate of jars) {
-            const context = selector.workspacePath || candidate.contextPath || path.dirname(candidate.jarPath);
-            const cached = await jarIndexer.hasDeepIndex(candidate.jarPath, context);
+        for (const { candidate, context, cached } of ordered) {
             if (!cached && newlyScanned >= maxNewJars) {
                 remainingUnindexed++;
                 continue;
@@ -401,9 +462,7 @@ export class ArtifactService {
         const allClasses = new Map<string, { jarPath: string; superClass?: string; interfaces: string[]; accessFlags: number }>();
         let newlyScanned = 0;
         let remainingUnindexed = 0;
-        for (const candidate of jars) {
-            const context = selector.workspacePath || candidate.contextPath || path.dirname(candidate.jarPath);
-            const cached = await jarIndexer.hasDeepIndex(candidate.jarPath, context);
+        for (const { candidate, context, cached } of await this.orderForDeepSearch(jars, selector, targetClass)) {
             if (!cached && newlyScanned >= maxNewJars) {
                 remainingUnindexed++;
                 continue;
@@ -560,6 +619,143 @@ export class ArtifactService {
         }
         const jars = [...new Map(results.map(candidate => [path.resolve(candidate.jarPath), candidate])).values()];
         return { jars, pending, errors };
+    }
+
+    /**
+     * Already deep-indexed JARs first (free), then JARs whose Maven path matches the query's package
+     * (e.g. org.springframework.context.ApplicationListener -> spring-context), so the per-call budget
+     * of new deep scans is spent where matches are most likely.
+     */
+    private async orderForDeepSearch(
+        jars: JarCandidate[],
+        selector: ArtifactSelector,
+        relevanceQuery: string,
+    ): Promise<Array<{ candidate: JarCandidate; context: string; cached: boolean; relevance: number }>> {
+        const relevance = this.packageRelevance(relevanceQuery.replace(/[#(].*$/, '').replace(/\$/g, '.'));
+        const ordered = [];
+        for (const candidate of jars) {
+            const context = selector.workspacePath || candidate.contextPath || path.dirname(candidate.jarPath);
+            ordered.push({ candidate, context, cached: await jarIndexer.hasDeepIndex(candidate.jarPath, context), relevance: relevance(candidate.jarPath) });
+        }
+        return ordered
+            .map((item, position) => ({ ...item, position }))
+            .sort((a, b) => Number(b.cached) - Number(a.cached) || b.relevance - a.relevance || a.position - b.position);
+    }
+
+    /**
+     * Classes present in more than one classpath JAR (split packages, relocated/shaded copies,
+     * two versions of one artifact). Uses the background class index plus on-demand light scans of
+     * JARs the background scan has not reached yet.
+     */
+    async findDuplicateClasses(
+        selector: ArtifactSelector,
+        options: { query?: string; limit?: number; classLimit?: number; maxNewJars?: number; deadlineMs?: number } = {},
+    ): Promise<DuplicateClassesResult> {
+        const limit = options.limit ?? 50;
+        const classLimit = options.classLimit ?? 10;
+        const maxNewJars = options.maxNewJars ?? 200;
+        const deadline = Date.now() + (options.deadlineMs ?? 20_000);
+        const query = (options.query ?? '').trim().toLowerCase();
+        const errors: ArtifactScanError[] = [];
+        const hasSelector = Boolean(selector.jarPath || selector.jarNamePrefix || selector.jarDirectory || selector.coordinates);
+        const scopes: Array<{ contextPath: string; jars: string[]; indexed: Map<string, Set<string>>; processed: Set<string> }> = [];
+        let pending = false;
+
+        if (hasSelector) {
+            const found = await this.findJars(selector, selector.jarPath ? 'exact' : 'prefix', 10_000);
+            pending ||= !found.complete;
+            errors.push(...found.errors);
+            const contextPath = selector.workspacePath || selector.jarDirectory || (found.results[0] ? path.dirname(found.results[0].jarPath) : process.cwd());
+            scopes.push({ contextPath, jars: found.results.map(item => item.jarPath), indexed: new Map(), processed: new Set() });
+        } else if (selector.workspacePath) {
+            for (const contextPath of await this.getContextPaths(selector.workspacePath)) {
+                const classpath = await this.getMavenClasspath(contextPath, selector);
+                pending ||= classpath.pending;
+                if (classpath.error) errors.push(classpath.error);
+                const indexed = new Map<string, Set<string>>();
+                for (const entry of await projectCache.getAllEntriesWithDuplicates(contextPath)) {
+                    if (!indexed.has(entry.className)) indexed.set(entry.className, new Set());
+                    indexed.get(entry.className)!.add(path.resolve(entry.jarPath));
+                }
+                const state = await projectCache.getScanState(contextPath);
+                scopes.push({ contextPath, jars: classpath.jarPaths, indexed, processed: new Set((state?.processedJars ?? []).map(jar => path.resolve(jar))) });
+            }
+        }
+
+        let scannedJarCount = 0;
+        let remainingJarCount = 0;
+        const groups = new Map<string, DuplicateClassGroup>();
+        for (const scope of scopes) {
+            const owners = scope.indexed;
+            for (const jarPath of scope.jars) {
+                const resolved = path.resolve(jarPath);
+                if (scope.processed.has(resolved)) continue;
+                if (scannedJarCount >= maxNewJars || Date.now() > deadline) { remainingJarCount++; continue; }
+                try {
+                    const index = await jarScanCoordinator.scanLight(jarPath, scope.contextPath, 'foreground');
+                    scannedJarCount++;
+                    for (const entry of index.classes) {
+                        if (entry.isInner || entry.isSource) continue;
+                        if (!owners.has(entry.className)) owners.set(entry.className, new Set());
+                        owners.get(entry.className)!.add(resolved);
+                    }
+                } catch (error) {
+                    scannedJarCount++;
+                    errors.push({ jarPath, contextPath: scope.contextPath, message: this.errorMessage(error) });
+                }
+            }
+            const onClasspath = new Set(scope.jars.map(jar => path.resolve(jar)));
+            for (const [className, jarSet] of owners) {
+                const jarsForClass = [...jarSet].filter(jar => onClasspath.size === 0 || onClasspath.has(jar)).sort();
+                if (jarsForClass.length < 2) continue;
+                if (query && !className.toLowerCase().includes(query)) continue;
+                const key = `${scope.contextPath}\n${jarsForClass.join('\n')}`;
+                let group = groups.get(key);
+                if (!group) {
+                    const artifacts = jarsForClass.map(jar => ({ jarPath: jar, ...this.coordinatesFromJarPath(jar) }));
+                    const artifactIds = new Set(artifacts.map(item => item.groupId && item.artifactId ? `${item.groupId}:${item.artifactId}` : path.basename(item.jarPath)));
+                    group = {
+                        contextPath: scope.contextPath,
+                        jars: artifacts,
+                        kind: artifactIds.size === 1 ? 'same-artifact-multiple-versions' : 'different-artifacts',
+                        classCount: 0,
+                        packages: [],
+                        sampleClasses: [],
+                    };
+                    groups.set(key, group);
+                }
+                group.classCount++;
+                const pkg = className.includes('.') ? className.substring(0, className.lastIndexOf('.')) : '';
+                if (!group.packages.includes(pkg) && group.packages.length < 20) group.packages.push(pkg);
+                if (group.sampleClasses.length < classLimit) group.sampleClasses.push(className);
+            }
+        }
+
+        const sorted = [...groups.values()]
+            .map(group => ({ ...group, packages: group.packages.sort(), sampleClasses: group.sampleClasses.sort() }))
+            .sort((a, b) => Number(b.kind === 'same-artifact-multiple-versions') - Number(a.kind === 'same-artifact-multiple-versions') || b.classCount - a.classCount);
+        return {
+            groups: sorted.slice(0, Math.max(1, limit)),
+            totalGroups: sorted.length,
+            totalDuplicateClasses: sorted.reduce((sum, group) => sum + group.classCount, 0),
+            complete: !pending && remainingJarCount === 0 && errors.length === 0,
+            scannedJarCount,
+            remainingJarCount,
+            errors,
+        };
+
+    }
+
+    /** groupId/artifactId/version from a Maven repository layout path (.../g/r/o/u/p/artifact/version/artifact-version.jar). */
+    private coordinatesFromJarPath(jarPath: string): { groupId?: string; artifactId?: string; version?: string } {
+        const parts = path.resolve(jarPath).split(/[\\/]/);
+        const file = parts[parts.length - 1];
+        const version = parts[parts.length - 2];
+        const artifactId = parts[parts.length - 3];
+        if (!file || !version || !artifactId || !file.startsWith(`${artifactId}-${version}`)) return {};
+        const repoIndex = parts.lastIndexOf('repository');
+        const groupParts = repoIndex >= 0 ? parts.slice(repoIndex + 1, parts.length - 3) : [];
+        return { groupId: groupParts.length ? groupParts.join('.') : undefined, artifactId, version };
     }
 
     private async getMavenClasspath(

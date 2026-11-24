@@ -58,6 +58,7 @@ describe('JavaClassAnalyzerMCPServer', () => {
                 'search_class',
                 'search_code',
                 'find_implementations',
+                'find_duplicates',
                 'inspect_class',
                 'explain_dependency',
                 'search_resources',
@@ -96,6 +97,19 @@ describe('JavaClassAnalyzerMCPServer', () => {
             expect(result.content[0].text).toMatch(/Class not found/);
             expect(result.content[0].text).toMatch(/ConsoleDecompiler/);
         });
+        it('inspects nested classes by binary or source-style name', async () => {
+            const jarPath = path.resolve('lib', 'vineflower-1.12.0.jar');
+            const binary = await callTool('inspect_class', { className: 'org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler$SaveType', jarPath, view: 'all' });
+            expect(binary.isError).toBeFalsy();
+            const text = binary.content[0].text;
+            expect(text).toMatch(/Enclosing class: org\.jetbrains\.java\.decompiler\.main\.decompiler\.ConsoleDecompiler/);
+            expect(text).toMatch(/enum SaveType/);
+            expect(text).not.toMatch(/class ConsoleDecompiler/);
+            expect(text).toMatch(/API \(javap -p\)/);
+            const dotted = await callTool('inspect_class', { className: 'org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler.SaveType', jarPath, view: 'api' });
+            expect(dotted.isError).toBeFalsy();
+            expect(dotted.content[0].text).toMatch(/ConsoleDecompiler\$SaveType/);
+        }, 60_000);
     });
 
     describe('sliceSource', () => {
