@@ -758,8 +758,15 @@ export class ArtifactService {
         const version = parts[parts.length - 2];
         const artifactId = parts[parts.length - 3];
         if (!file || !version || !artifactId || !file.startsWith(`${artifactId}-${version}`)) return {};
+        // Prefer the configured local repository root (MAVEN_REPO may not end in "repository", and a groupId
+        // may itself contain a "repository" segment); fall back to the last "repository" directory.
+        const repositoryRoot = path.resolve(process.env.MAVEN_REPO || path.join(os.homedir(), '.m2', 'repository')).split(/[\\/]/).filter(Boolean);
+        const absolute = parts.filter(Boolean);
+        const underRoot = repositoryRoot.length < absolute.length - 3 && repositoryRoot.every((segment, index) => absolute[index] === segment);
         const repoIndex = parts.lastIndexOf('repository');
-        const groupParts = repoIndex >= 0 ? parts.slice(repoIndex + 1, parts.length - 3) : [];
+        const groupParts = underRoot
+            ? absolute.slice(repositoryRoot.length, absolute.length - 3)
+            : repoIndex >= 0 ? parts.slice(repoIndex + 1, parts.length - 3) : [];
         return { groupId: groupParts.length ? groupParts.join('.') : undefined, artifactId, version };
     }
 
@@ -788,7 +795,20 @@ export class ArtifactService {
                 await options.onWait?.(`Still resolving Maven classpath (${Math.round(elapsed / 1000)}s)...`);
             });
         }
+        if (refreshed === null && !this.scanner.isResolvingClasspath(contextPath)) {
+            // Resolution finished without a classpath: report Maven's/Gradle's error instead of "still resolving".
+            await new Promise(resolve => setImmediate(resolve));
+            const failure = this.scanner.peekScanError(contextPath);
+            if (failure) return { jarPaths: [], pending: false, error: { contextPath, message: `Classpath resolution failed: ${this.summarizeBuildError(failure)}` } };
+        }
         return { jarPaths: refreshed ?? [], pending: refreshed === null };
+    }
+
+    /** First [ERROR] lines of a Maven/Gradle failure; the full output is in the server log. */
+    private summarizeBuildError(message: string): string {
+        const errors = [...new Set(message.split('\n').map(line => line.trim()).filter(line => /^\[ERROR\]\s+\S/.test(line) && !/\[Help \d+\]|re-run Maven|Re-run Maven|For more information|After correcting|mvn <args>|full stack trace/i.test(line)))].slice(0, 4);
+        const first = message.split('\n')[0].substring(0, 300);
+        return errors.length ? `${first}\n${errors.join('\n')}` : message.substring(0, 800);
     }
 
     private errorMessage(error: unknown): string {

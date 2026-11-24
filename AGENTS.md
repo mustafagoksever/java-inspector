@@ -163,7 +163,7 @@ After the transport connects, top-level `pom.xml` directories under `cwd` are di
 - `methodName` not declared in the class → BFS over superclasses/interfaces (`inheritedMemberSource`, ≤ 25 classes).
 - `downloadSources` (Maven): `mvn dependency:get ...:jar:sources` once per GAV, then the sources JAR is used.
 - Vineflower failures (`$VF: Couldn't be decompiled`) are cleaned by `cleanDecompilerFailures`; failed methods are listed in `sourceNote`.
-- `view=api`: `javap -p` output (plus class-file metadata in `json` format).
+- `view=api`: `javap -p` output (in `json` format too; the separate fields/methods arrays were dropped because they duplicated it).
 - `view=hierarchy`: superclass chain with interfaces per level.
 - `view=bytecode`: `javap -c -l -p -s`; with `methodName`/`line` only that member; over `BYTECODE_AUTO_LIMIT` lines only member signatures.
 

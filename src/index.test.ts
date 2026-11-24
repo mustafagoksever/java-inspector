@@ -176,6 +176,17 @@ describe('JavaClassAnalyzerMCPServer', () => {
             expect((server as any).sliceSource(big, { limit: 600 }).source).toBe(big);
         });
 
+        it('shrinks oversized json results into valid json instead of cutting the text', async () => {
+            const structured = { items: Array.from({ length: 3000 }, (_, index) => ({ name: `item-${index}`, value: 'v'.repeat(20) })), source: 'x'.repeat(30_000) };
+            const response = (server as any).formatResponse('text', structured, 'json');
+            const text = response.content[0].text;
+            expect(text.length).toBeLessThanOrEqual(40_000);
+            const parsed = JSON.parse(text);
+            expect(parsed.truncated).toMatchObject({ maxChars: 40_000 });
+            expect(parsed.items.length).toBeGreaterThan(0);
+            expect(parsed.items.length).toBeLessThan(3000);
+        });
+
         it('caps oversized responses with a hint', () => {
             const capped = (server as any).capResponse('x'.repeat(10) + '\n' + 'y'.repeat(50_000));
             expect(capped.length).toBeLessThan(41_000);

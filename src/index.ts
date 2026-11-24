@@ -17,7 +17,7 @@ import { DeepClassEntry, jarIndexer } from './scanner/JarIndexer.js';
 import { buildToolOf, projectDiscovery } from './scanner/ProjectDiscovery.js';
 import { ClassFileMetadataReader } from './scanner/ClassFileMetadataReader.js';
 import { getResultCacheDir } from './utils/cachePaths.js';
-import { extractMethod, extractTypeDeclaration } from './utils/methodExtractor.js';
+import { extractMethod, extractParamTypes, extractTypeDeclaration } from './utils/methodExtractor.js';
 import { buildOutline, cleanDecompilerFailures, extractMembers, formatOutline, JavapMember, javapMemberAtLine, memberAtLine, memberRangeWithDoc, OutlineMember, parseJavapMembers, selectJavapMembers } from './utils/javaOutline.js';
 import { Logger } from './utils/Logger.js';
 
@@ -74,6 +74,47 @@ const SELECTOR = {
     jarNamePrefix: z.string().optional().describe('Only JARs whose file name starts with this, e.g. "jackson-databind".'),
     coordinates: z.string().optional().describe('groupId:artifactId[:version[:classifier]] from the local Maven repository.'),
 };
+/**
+ * Shrink a structured result until its serialized size is <= MAX_RESPONSE_CHARS: repeatedly halve the
+ * largest array or string, then record what was dropped in `truncated`. The result is always valid JSON.
+ */
+export function shrinkStructured(value: object, size: (value: object) => number, max = MAX_RESPONSE_CHARS): object {
+    const originalChars = size(value);
+    if (originalChars <= max) return value;
+    const copy = JSON.parse(JSON.stringify(value));
+    const dropped: string[] = [];
+    for (let round = 0; round < 60 && size(copy) > max - 400; round++) {
+        let best: { parent: any; key: string | number; path: string; weight: number } | null = null;
+        const visit = (node: any, parent: any, key: string | number, nodePath: string) => {
+            if (typeof node === 'string' && node.length > 200) {
+                if (!best || node.length > best.weight) best = { parent, key, path: nodePath, weight: node.length };
+            } else if (Array.isArray(node)) {
+                if (node.length > 1) {
+                    const weight = JSON.stringify(node).length;
+                    if (!best || weight > best.weight) best = { parent, key, path: nodePath, weight };
+                }
+                node.forEach((child, index) => visit(child, node, index, `${nodePath}[${index}]`));
+            } else if (node && typeof node === 'object') {
+                for (const [childKey, child] of Object.entries(node)) visit(child, node, childKey, nodePath ? `${nodePath}.${childKey}` : childKey);
+            }
+        };
+        visit(copy, null, '', '');
+        const target = best as { parent: any; key: string | number; path: string } | null;
+        if (!target || target.parent === null) break;
+        const current = target.parent[target.key];
+        if (typeof current === 'string') {
+            target.parent[target.key] = `${current.substring(0, Math.floor(current.length / 2))}\n[... truncated]`;
+            if (!dropped.includes(target.path.replace(/\[\d+\]/g, '[]'))) dropped.push(target.path.replace(/\[\d+\]/g, '[]'));
+        } else {
+            target.parent[target.key] = current.slice(0, Math.max(1, Math.floor(current.length / 2)));
+            const label = `${target.path.replace(/\[\d+\]/g, '[]')}`;
+            if (!dropped.includes(label)) dropped.push(label);
+        }
+    }
+    copy.truncated = { originalChars, maxChars: max, shortened: dropped, note: 'Result shortened to fit the response limit; narrow the request (query, limit, className, methodName) for the rest.' };
+    return copy;
+}
+
 const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
 
 export class JavaClassAnalyzerMCPServer {
@@ -383,7 +424,8 @@ export class JavaClassAnalyzerMCPServer {
         }
         if (!unique.length) {
             const suggestions = this.uniqueClassCandidates(resolved.results).slice(0, 10).map(item => `- ${item.className} -> ${item.jarPath}`);
-            const partial = resolved.complete ? '' : (resolved.results.length === 0 && resolved.scannedJarCount === 0
+            const buildErrors = resolved.errors.filter(error => error.contextPath && !error.jarPath).map(error => error.message).slice(0, 1);
+            const partial = buildErrors.length ? ` ${buildErrors.join('\n')}` : resolved.complete ? '' : (resolved.results.length === 0 && resolved.scannedJarCount === 0
                 ? ' The Maven classpath is still being resolved (first run for this project); call again in a moment with the same arguments.'
                 : ` ${resolved.remainingJarCount} dependency JAR(s) were not searched yet; call again with the same arguments.`);
             throw new Error(`Class not found: ${requested}.${partial}${suggestions.length ? `\nSimilar classes:\n${suggestions.join('\n')}` : ' Use search_class with a partial name.'}`);
@@ -520,14 +562,11 @@ export class JavaClassAnalyzerMCPServer {
                 projects.push({
                     projectPath: contexts[i],
                     modules: modules.map(module => {
-                        // Keep each match's ancestors so the path is visible (query) and direct-only/scope filters apply per node.
-                        const stack: string[] = [];
+                        // Filtered results are rendered flat with their parent (via), so the tree shape is not needed.
                         const dependencies = module.dependencies.filter(dep => {
-                            stack.length = dep.depth - 1;
-                            stack.push(`${dep.groupId}:${dep.artifactId}`);
                             if (args.directOnly && dep.depth > 1) return false;
                             if (args.scope && dep.scope !== args.scope) return false;
-                            return !query || stack[stack.length - 1].toLowerCase().includes(query);
+                            return !query || `${dep.groupId}:${dep.artifactId}`.toLowerCase().includes(query);
                         });
                         return { module: module.module, dependencies, directCount: module.dependencies.filter(dep => dep.depth === 1).length, transitiveCount: module.dependencies.filter(dep => dep.depth > 1).length };
                     }),
@@ -549,7 +588,7 @@ export class JavaClassAnalyzerMCPServer {
                 const rows = module.dependencies.flatMap(dep => {
                     if (remaining <= 0) { truncated++; return []; }
                     remaining--;
-                    if (query) return [`- ${render(dep)}${dep.depth > 1 ? ` (transitive, via ${dep.via})` : ' (direct)'}`];
+                    if (filtered) return [`- ${render(dep)}${dep.depth > 1 ? ` (transitive, via ${dep.via})` : ' (direct)'}`];
                     return [`${'  '.repeat(dep.depth - 1)}${dep.depth === 1 ? '- ' : '\\- '}${render(dep)}`];
                 });
                 return [header, ...rows].join('\n');
@@ -732,7 +771,8 @@ export class JavaClassAnalyzerMCPServer {
                 : `${className} was compiled without line numbers (no LineNumberTable); use methodName instead.`);
         }
         let name = hit.name;
-        let paramTypes: string[] | undefined = hit.paramTypes.map(type => type.replace(/<.*>/g, ''));
+        // javap prints com.acme.Outer$Key; the source says Key (or Outer.Key): compare simple names.
+        let paramTypes: string[] | undefined = hit.paramTypes.map(type => type.replace(/<.*>/g, '').replace(/^[\w.$]*[.$](?=[\w]+(\[\]|\.\.\.)*$)/, ''));
         let where = hit.signature.replace(/;$/, '');
         const lambda = name.match(/^lambda\$(.+)\$\d+$/);
         if (lambda) { name = lambda[1]; paramTypes = undefined; where = `a lambda inside ${name}()`; }
@@ -745,7 +785,21 @@ export class JavaClassAnalyzerMCPServer {
             if (init) { const range = memberRangeWithDoc(lines, init); found = { text: lines.slice(range.start - 1, range.end).join('\n') }; }
         } else {
             const memberName = name === '<init>' ? simple : name;
-            found = extractMembers(source, memberName, paramTypes, scope)[0] ?? extractMembers(source, memberName, undefined, scope)[0];
+            const typed = paramTypes ? extractMembers(source, memberName, paramTypes, scope) : [];
+            // Inner-class constructors carry the synthetic outer instance as first javap parameter.
+            const withoutOuter = !typed.length && name === '<init>' && paramTypes?.length ? extractMembers(source, memberName, paramTypes.slice(1), scope) : [];
+            const exact = typed.length ? typed : withoutOuter;
+            if (exact.length) {
+                found = exact[0];
+            } else {
+                const byName = extractMembers(source, memberName, undefined, scope);
+                const sameArity = paramTypes ? byName.filter(item => extractParamTypes(item.member.signature).length === paramTypes!.length) : byName;
+                const candidates = sameArity.length ? sameArity : byName;
+                if (candidates.length === 1) found = candidates[0];
+                else if (candidates.length > 1) {
+                    return { source: hit.text, lineInfo: `Original line ${line} is in ${where}; ${candidates.length} overloads of ${memberName} in the decompiled source could not be told apart, so its bytecode is shown. Use methodName with paramTypes for the source.` };
+                }
+            }
         }
         if (!found) return { source: hit.text, lineInfo: `Original line ${line} is in ${where}; it could not be located in the decompiled source, showing its bytecode instead.` };
         return { source: found.text, lineInfo: `Original line ${line} is in ${where}. The source is decompiled, so its line numbers differ from the stack trace; the whole member is shown.` };
@@ -1025,10 +1079,13 @@ export class JavaClassAnalyzerMCPServer {
     }
 
     private formatResponse(text: string, structured: object, format: Format = 'text'): { content: Array<{ type: 'text'; text: string }> } {
-        const wrap = (value: string) => ({ content: [{ type: 'text' as const, text: this.capResponse(value) }] });
-        if (format === 'json') return wrap(JSON.stringify(structured, null, 2));
-        if (format === 'toon') { try { return wrap(toonEncode(structured)); } catch { return wrap(text); } }
-        return wrap(text);
+        const wrap = (value: string) => ({ content: [{ type: 'text' as const, text: value }] });
+        // Structured output must stay parseable, so it is shrunk (long arrays/strings halved) instead of cut.
+        if (format === 'json') return wrap(JSON.stringify(shrinkStructured(structured, value => JSON.stringify(value, null, 2).length), null, 2));
+        if (format === 'toon') {
+            try { return wrap(toonEncode(shrinkStructured(structured, value => toonEncode(value).length) as any)); } catch { return wrap(this.capResponse(text)); }
+        }
+        return wrap(this.capResponse(text));
     }
 
     /** Text lists grouped under their JAR, so long Maven paths are printed once instead of per line. */

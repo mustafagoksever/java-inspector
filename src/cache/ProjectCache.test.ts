@@ -80,6 +80,45 @@ describe('ProjectCache', () => {
         });
     });
 
+    describe('build file hashing and partial classpaths', () => {
+        it('changes the hash when a module pom.xml or a Gradle subproject build file changes', async () => {
+            const project = createTestProject();
+            try {
+                fs.mkdirSync(path.join(project, 'module-a'));
+                fs.writeFileSync(path.join(project, 'module-a', 'pom.xml'), '<project><version>2.15</version></project>');
+                const before = await new ProjectCache().getPomHash(project);
+                fs.writeFileSync(path.join(project, 'module-a', 'pom.xml'), '<project><version>2.17.0</version></project>');
+                expect(await new ProjectCache().getPomHash(project)).not.toBe(before);
+
+                fs.rmSync(path.join(project, 'pom.xml'));
+                fs.rmSync(path.join(project, 'module-a'), { recursive: true });
+                fs.writeFileSync(path.join(project, 'settings.gradle'), "include 'app'");
+                fs.mkdirSync(path.join(project, 'app'));
+                fs.writeFileSync(path.join(project, 'app', 'build.gradle'), 'dependencies {}');
+                const gradleBefore = await new ProjectCache().getPomHash(project);
+                fs.writeFileSync(path.join(project, 'app', 'build.gradle'), "dependencies { implementation 'com.squareup.okhttp3:okhttp:4.12.0' }");
+                expect(await new ProjectCache().getPomHash(project)).not.toBe(gradleBefore);
+            } finally {
+                await cleanupTestProject(project);
+            }
+        });
+
+        it('expires a partial classpath so it is resolved again', async () => {
+            const project = createTestProject();
+            try {
+                const pomHash = await cache.getPomHash(project);
+                await cache.saveClasspath(project, ['/a.jar'], pomHash, true);
+                expect(await cache.getClasspath(project)).toEqual(['/a.jar']);
+                const file = path.join(getProjectCacheDir(project), 'classpath.json');
+                const data = JSON.parse(fs.readFileSync(file, 'utf-8'));
+                fs.writeFileSync(file, JSON.stringify({ ...data, timestamp: new Date(Date.now() - 11 * 60_000).toISOString() }));
+                expect(await cache.getClasspath(project)).toBeNull();
+            } finally {
+                await cleanupTestProject(project);
+            }
+        });
+    });
+
     describe('classpath persistence', () => {
         it('should save and retrieve classpath', async () => {
             const project = createTestProject();

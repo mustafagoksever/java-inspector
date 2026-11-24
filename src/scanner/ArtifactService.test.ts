@@ -244,6 +244,20 @@ describe('ArtifactService', () => {
     });
 });
 
+describe('ArtifactService coordinates', () => {
+    it('reads the groupId relative to MAVEN_REPO, even without a "repository" directory or with one in the groupId', () => {
+        const service = new ArtifactService();
+        const previous = process.env.MAVEN_REPO;
+        process.env.MAVEN_REPO = path.join(os.tmpdir(), 'm2');
+        try {
+            expect(service.coordinatesFromJarPath(path.join(os.tmpdir(), 'm2', 'com', 'acme', 'repository', 'store', '1.0', 'store-1.0.jar')))
+                .toEqual({ groupId: 'com.acme.repository', artifactId: 'store', version: '1.0' });
+        } finally {
+            if (previous === undefined) delete process.env.MAVEN_REPO; else process.env.MAVEN_REPO = previous;
+        }
+    });
+});
+
 describe('ArtifactService Gradle cache layout', () => {
     it('reads coordinates and finds the sources JAR in a sibling hash directory', async () => {
         const service = new ArtifactService();

@@ -95,6 +95,8 @@ allprojects { p ->
 `;
 
 export class DependencyScanner {
+    /** Projects whose last classpath came from recoverReactorClasspath with JARs missing. */
+    private partialClasspaths = new Set<string>();
     private static instance: DependencyScanner;
     private classpathPromises = new Map<string, Promise<string[]>>();
     private mavenCommand: string | null = null;
@@ -340,7 +342,9 @@ export class DependencyScanner {
 
             const pomHash = await projectCache.getPomHash(projectPath);
             const classpathHash = projectCache.getClasspathHash(jarPaths);
-            await projectCache.saveClasspath(projectPath, jarPaths, pomHash);
+            const partial = this.partialClasspaths.delete(projectPath);
+            await projectCache.saveClasspath(projectPath, jarPaths, pomHash, partial);
+            if (partial) logger.warn('[MAVEN] Classpath is partial (some dependencies are not in the local repository); it will be resolved again in 10 minutes.');
 
             logger.info(`[MAVEN] Classpath resolved. ${jarPaths.length} JARs found. Starting background scan...`);
             await onProgress?.(`Classpath resolved: ${jarPaths.length} JARs. Starting background scan...`, 10, 100);
@@ -458,6 +462,11 @@ export class DependencyScanner {
      * Single-class lookups use this so a cold start does not answer "class not found" while
      * Maven is still running.
      */
+    /** The last classpath/scan failure of a project, without clearing it (scanProject reports and clears it). */
+    peekScanError(projectPath: string): string | undefined {
+        return this.scanErrors.get(projectPath);
+    }
+
     async waitForClasspath(projectPath: string, timeoutMs: number, onWait?: (elapsedMs: number) => Promise<void>): Promise<string[] | null> {
         const deadline = Date.now() + Math.max(0, timeoutMs);
         const started = Date.now();
@@ -642,6 +651,11 @@ export class DependencyScanner {
     private async recoverReactorClasspath(projectPath: string, mavenCmd: string, outputFile: string, details: string): Promise<string[] | null> {
         if (!/Could not resolve dependencies|was not found in|Could not find artifact/.test(details)) return null;
         const logger = Logger.get(projectPath);
+        const reactorPoms = await this.reactorCoordinates(projectPath);
+        // Only an unresolved *reactor module* is recoverable; a missing external artifact (network or
+        // repository problem) must stay an error instead of becoming a silently incomplete classpath.
+        const unresolved = details.replace(/for project \S+/g, '');
+        if (![...reactorPoms].some(ga => unresolved.includes(`${ga}:`))) return null;
         logger.info('[MAVEN] Classpath resolution failed on a module dependency; retrying with --fail-at-end and dependency:tree (unbuilt sibling modules?)');
         await execFileAsync(mavenCmd, ['-B', '-q', '-fae', 'dependency:build-classpath', `-Dmdep.outputFile=${outputFile}`], {
             cwd: projectPath, timeout: 300000, shell: process.platform === 'win32', maxBuffer: 10 * 1024 * 1024,
@@ -664,7 +678,26 @@ export class DependencyScanner {
             if (await fs.pathExists(jar)) jars.push(jar); else missing++;
         }
         logger.info(`[MAVEN] Recovered ${jars.length} JAR(s) from the dependency tree of ${modules.length} module(s)${missing ? `; ${missing} not downloaded yet` : ''}. Reactor modules are skipped (their code is in the workspace).`);
+        if (missing) this.partialClasspaths.add(projectPath); else this.partialClasspaths.delete(projectPath);
         return jars;
+    }
+
+    /** groupId:artifactId of every module pom under the project (parent groupId when the module has none). */
+    private async reactorCoordinates(projectPath: string): Promise<Set<string>> {
+        const result = new Set<string>();
+        const visit = async (directory: string, depth: number) => {
+            const pom = await fs.readFile(path.join(directory, 'pom.xml'), 'utf-8').catch(() => null);
+            if (pom === null) return;
+            const withoutParent = pom.replace(/<parent>[\s\S]*?<\/parent>/, '').replace(/<(dependencies|dependencyManagement|build|profiles|plugins)>[\s\S]*$/, '');
+            const parentGroup = pom.match(/<parent>[\s\S]*?<groupId>\s*([^<\s]+)\s*<\/groupId>/)?.[1];
+            const groupId = withoutParent.match(/<groupId>\s*([^<\s]+)\s*<\/groupId>/)?.[1] ?? parentGroup;
+            const artifactId = withoutParent.match(/<artifactId>\s*([^<\s]+)\s*<\/artifactId>/)?.[1];
+            if (groupId && artifactId) result.add(`${groupId}:${artifactId}`);
+            if (depth >= 6) return;
+            for (const module of pom.matchAll(/<module>\s*([^<]+?)\s*<\/module>/g)) await visit(path.resolve(directory, module[1]), depth + 1);
+        };
+        await visit(projectPath, 0);
+        return result;
     }
 
     private async runDependencyTree(projectPath: string, mavenCmd: string): Promise<ModuleDependencies[]> {

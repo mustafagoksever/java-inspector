@@ -27,6 +27,19 @@ type Frame = { kind: 'type' | 'body' | 'init'; typeName?: string; member?: Outli
 const TYPE_DECL = /(?:^|[\s(@])(class|interface|enum|record)\s+([A-Za-z_$][\w$]*)/;
 const CONTROL = /^(if|for|while|switch|catch|synchronized|try|do|else|return|new|throw|case|yield)\b/;
 
+/** Last comma-separated item outside parentheses/braces: `A(1, 2) {...}, B("x", 3)` -> `B("x", 3)`. */
+function lastTopLevelItem(text: string): string {
+    let depth = 0;
+    let start = 0;
+    for (let index = 0; index < text.length; index++) {
+        const ch = text[index];
+        if (ch === '(' || ch === '{' || ch === '[') depth++;
+        else if (ch === ')' || ch === '}' || ch === ']') depth = Math.max(0, depth - 1);
+        else if (ch === ',' && depth === 0) start = index + 1;
+    }
+    return text.substring(start).trim();
+}
+
 export function buildOutline(source: string): OutlineMember[] {
     const members: OutlineMember[] = [];
     const stack: Frame[] = [];
@@ -68,8 +81,8 @@ export function buildOutline(source: string): OutlineMember[] {
             append('""');
             i += 3;
             while (i < n && !(source[i] === '"' && source[i + 1] === '"' && source[i + 2] === '"')) {
-                if (source[i] === '\\') i++;
-                else if (source[i] === '\n') line++;
+                if (source[i] === '\\') i++; // the escaped character may be a newline (line continuation)
+                if (source[i] === '\n') line++;
                 i++;
             }
             i += 3;
@@ -95,7 +108,7 @@ export function buildOutline(source: string): OutlineMember[] {
                 stack.push({ kind: top.kind === 'init' ? 'init' : 'body' });
             } else {
                 const decl = text.trim();
-                const enumConstantBody = Boolean(top?.enumStart) && /^[A-Z_$][\w$]*\s*(\(.*\))?$/.test(stripAnnotations(decl).split(',').pop()!.trim());
+                const enumConstantBody = Boolean(top?.enumStart) && /^[A-Z_$][\w$]*\s*(\(.*\))?$/.test(lastTopLevelItem(stripAnnotations(decl)));
                 if (enumConstantBody || inFieldInitializer(decl)) {
                     // Body of an enum constant, or array initializer / lambda / anonymous class of a field.
                     stack.push({ kind: 'init' });

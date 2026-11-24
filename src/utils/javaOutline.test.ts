@@ -159,6 +159,34 @@ describe('parseJavapMembers', () => {
     });
 });
 
+describe('buildOutline edge cases', () => {
+    it('keeps enum constants with several arguments and bodies out of the method list', () => {
+        const outline = buildOutline([
+            'enum Op {',
+            '    PLUS("+", 1) { int apply(int a, int b) { return a + b; } },',
+            '    MINUS("-", 2) { int apply(int a, int b) { return a - b; } };',
+            '    Op(String symbol, int order) {}',
+            '    abstract int apply(int a, int b);',
+            '}',
+        ].join('\n'));
+        expect(outline.filter(member => member.kind === 'method').map(member => member.name)).toEqual(['apply']);
+        expect(outline.find(member => member.kind === 'enum-constants')).toMatchObject({ startLine: 2, endLine: 3 });
+        expect(outline.find(member => member.kind === 'constructor')).toMatchObject({ startLine: 4 });
+    });
+
+    it('counts line continuations inside text blocks', () => {
+        const outline = buildOutline([
+            'class T {',
+            '    String sql = """',
+            '        SELECT * \\',
+            '        FROM t""";',
+            '    void after() {}',
+            '}',
+        ].join('\n'));
+        expect(outline.find(member => member.name === 'after')).toMatchObject({ startLine: 5 });
+    });
+});
+
 describe('cleanDecompilerFailures', () => {
     it('replaces the Vineflower stack trace with one line and reports the method', () => {
         const source = [

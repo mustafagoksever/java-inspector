@@ -25,7 +25,16 @@ export interface ClasspathData {
     jarPaths: string[];
     classpathHash: string;
     timestamp: string;
+    /** Set when the classpath was recovered after a Maven failure and may lack JARs; re-resolved after PARTIAL_CLASSPATH_TTL_MS. */
+    partial?: boolean;
 }
+
+const PARTIAL_CLASSPATH_TTL_MS = 10 * 60_000;
+const BUILD_FILE_NAMES = new Set(['pom.xml', 'settings.gradle', 'settings.gradle.kts', 'build.gradle', 'build.gradle.kts', 'gradle.properties', 'libs.versions.toml']);
+const BUILD_FILE_SKIP_DIRS = new Set(['.git', '.idea', '.gradle', 'node_modules', 'target', 'build', 'out', 'dist', 'bin']);
+const BUILD_FILE_MAX_DEPTH = 6;
+const BUILD_FILE_MAX_DIRS = 5_000;
+const BUILD_FILE_LIST_TTL_MS = 30_000;
 
 export interface ScanStateData {
     schemaVersion?: 3;
@@ -49,6 +58,8 @@ export interface ClassIndexData {
 }
 
 export class ProjectCache {
+    private buildFileLists = new Map<string, { at: number; files: Promise<string[]> }>();
+    private buildFileHashes = new Map<string, { mtimeMs: number; size: number; hash: string }>();
     // In-memory indexes per project: Map<className, ClassIndexEntry>
     private indexes: Map<string, Map<string, ClassIndexEntry>> = new Map();
     // V3 view preserving duplicate FQCNs from different artifacts.
@@ -180,22 +191,58 @@ export class ProjectCache {
      * Compute SHA-256 hash of the project's pom.xml file.
      */
     async getPomHash(projectPath: string): Promise<string> {
-        const pomPath = path.join(projectPath, 'pom.xml');
-        if (await fs.pathExists(pomPath)) {
-            const content = await fs.readFile(pomPath, 'utf-8');
-            return createHash('sha256').update(content).digest('hex').substring(0, 16);
+        // Every module pom.xml / Gradle build file counts: a dependency added in module-a/pom.xml or
+        // app/build.gradle changes the resolved classpath just like one in the root build file.
+        const files = await this.listBuildFiles(projectPath);
+        if (!files.some(file => /^(pom\.xml|settings\.gradle(\.kts)?|build\.gradle(\.kts)?)$/.test(path.basename(file)))) {
+            throw new Error(`No pom.xml or Gradle build file in ${projectPath}`);
         }
-        // Gradle: the root build files and the version catalog decide the resolved classpath.
         const hash = createHash('sha256');
-        let found = false;
-        for (const name of ['settings.gradle', 'settings.gradle.kts', 'build.gradle', 'build.gradle.kts', 'gradle.properties', path.join('gradle', 'libs.versions.toml')]) {
-            const file = path.join(projectPath, name);
-            if (!(await fs.pathExists(file))) continue;
-            found = true;
-            hash.update(`${name}\n`).update(await fs.readFile(file));
+        for (const file of files) {
+            const fileHash = await this.hashBuildFile(file);
+            if (fileHash) hash.update(`${path.relative(projectPath, file)}\n${fileHash}\n`);
         }
-        if (!found) throw new Error(`No pom.xml or Gradle build file in ${projectPath}`);
         return hash.digest('hex').substring(0, 16);
+    }
+
+    /** Build files under the project (bounded walk, cached briefly); sorted for a stable hash. */
+    private listBuildFiles(projectPath: string): Promise<string[]> {
+        const key = path.resolve(projectPath);
+        const cached = this.buildFileLists.get(key);
+        if (cached && Date.now() - cached.at < BUILD_FILE_LIST_TTL_MS) return cached.files;
+        const files = (async () => {
+            const found: string[] = [];
+            let level = [key];
+            let visited = 0;
+            for (let depth = 0; depth <= BUILD_FILE_MAX_DEPTH && level.length && visited < BUILD_FILE_MAX_DIRS; depth++) {
+                const next: string[] = [];
+                for (const directory of level) {
+                    visited++;
+                    const entries = await fs.readdir(directory, { withFileTypes: true }).catch(() => [] as fs.Dirent[]);
+                    for (const entry of entries) {
+                        const full = path.join(directory, entry.name);
+                        if (entry.isFile() && BUILD_FILE_NAMES.has(entry.name)) found.push(full);
+                        else if (entry.isDirectory() && !entry.isSymbolicLink() && !entry.name.startsWith('.') && !BUILD_FILE_SKIP_DIRS.has(entry.name)) next.push(full);
+                    }
+                }
+                level = next;
+            }
+            return found.sort();
+        })();
+        this.buildFileLists.set(key, { at: Date.now(), files });
+        files.catch(() => this.buildFileLists.delete(key));
+        return files;
+    }
+
+    /** Content hash of one build file, memoized on mtime+size so repeated calls do not re-read it. */
+    private async hashBuildFile(file: string): Promise<string | null> {
+        const stat = await fs.stat(file).catch(() => null);
+        if (!stat) return null;
+        const cached = this.buildFileHashes.get(file);
+        if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.hash;
+        const hash = createHash('sha256').update(await fs.readFile(file)).digest('hex');
+        this.buildFileHashes.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, hash });
+        return hash;
     }
 
     /**
@@ -223,6 +270,7 @@ export class ProjectCache {
             if (data.pomHash !== currentHash) {
                 return null;
             }
+            if (data.partial && Date.now() - Date.parse(data.timestamp) > PARTIAL_CLASSPATH_TTL_MS) return null;
             return data.jarPaths;
         } catch {
             return null;
@@ -251,7 +299,7 @@ export class ProjectCache {
      * Save the classpath list, pom.xml hash, and classpath hash.
      * Protected by cross-process write.lock.
      */
-    async saveClasspath(projectPath: string, jarPaths: string[], pomHash: string): Promise<void> {
+    async saveClasspath(projectPath: string, jarPaths: string[], pomHash: string, partial = false): Promise<void> {
         const release = await CrossProcessLock.acquire(projectPath, 'write');
         try {
             await this.withInProcessLock(projectPath, async () => {
@@ -262,6 +310,7 @@ export class ProjectCache {
                     jarPaths,
                     classpathHash: this.getClasspathHash(jarPaths),
                     timestamp: new Date().toISOString(),
+                    ...(partial ? { partial: true } : {}),
                 };
                 await fs.outputJson(classpathPath, data, { spaces: 0 });
             });
@@ -361,6 +410,10 @@ export class ProjectCache {
         if (cachedCpHash && state.classpathHash !== cachedCpHash) {
             return false;
         }
+
+        // A recovered (partial) classpath is re-resolved after its TTL, so its index is not final either.
+        const classpathData = await fs.readJson(getClasspathPath(projectPath)).catch(() => null) as ClasspathData | null;
+        if (classpathData?.partial && Date.now() - Date.parse(classpathData.timestamp) > PARTIAL_CLASSPATH_TTL_MS) return false;
 
         return true;
     }
