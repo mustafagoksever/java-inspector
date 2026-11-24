@@ -54,7 +54,7 @@ export const SERVER_INSTRUCTIONS = `java-inspector gives read-only access to com
 
 Prefer these tools over shell commands for anything inside a JAR or the JDK:
 - Instead of \`javap\` / \`javap -c\` / \`javap -p\`: inspect_class with view "api" (signatures) or "bytecode".
-- Instead of decompiling by hand or guessing library behaviour: inspect_class with view "source" (uses -sources.jar when present, otherwise Vineflower). Pass methodName to get a single method; nested classes are addressed as Outer$Inner.
+- Instead of decompiling by hand or guessing library behaviour: inspect_class with view "source" (uses -sources.jar when present, otherwise Vineflower). Large class: view "outline" first, then methodName for one method (inherited methods are found too). Stack-trace frame "Foo.java:123": pass line=123. Nested classes: Outer$Inner.
 - For classes from the project's dependencies, pass only className (fully qualified). Do NOT look up the JAR in ~/.m2 / ~/.gradle or pass jarPath first: the server knows the project classpath and finds the JAR itself, waiting for Maven/Gradle if the project is opened for the first time.
 - Instead of \`unzip -l\`, \`jar tf\`, \`find ~/.m2 -name\`, \`grep -r\` over JARs: search_class, find_jar, inspect_jar, search_resources, read_resource.
 - Before upgrading a library, or for NoSuchMethodError/AbstractMethodError: compare_versions (API diff between two versions).

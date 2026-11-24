@@ -9,11 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Gradle support: Gradle builds are discovered and their classpath (compile, runtime, test, every project) is resolved with an init script; the Gradle cache layout is understood for coordinates and `-sources.jar` lookup. `list_dependencies`, `explain_dependency` and `downloadSources` stay Maven-only.
+- `compare_versions` tool: binary API diff between two versions of an artifact (fromVersion defaults to the classpath version; `download` fetches a missing one) or two JARs, with breaking changes flagged.
+- `list_dependencies` tool: resolved GAV, scope, direct/transitive with the pulling path, per Maven module; cached until `pom.xml` changes.
+- `inspect_class` `view: "outline"` (members with line ranges), `line` (method at a stack-trace line, also for decompiled code), inherited `methodName` lookup through superclasses and interfaces, `methodName`/`line` for `view: "bytecode"`, and `downloadSources` (opt-in `mvn dependency:get` of the `-sources.jar`).
 - `find_duplicates` tool: classes that exist in more than one classpath JAR, grouped by JAR set with Maven coordinates, flagged as `same-artifact-multiple-versions` or `different-artifacts` (split packages, shaded copies). Helps with NoSuchMethodError / ClassCastException investigations.
 - `inspect_class` and `search_class` accept nested classes (`com.acme.Outer$Inner`, or source-style `com.acme.Outer.Inner`). `view: "source"` returns just the nested declaration from the outer class source; api/bytecode/hierarchy use the nested class file.
 - `search_code` and `find_implementations` open already deep-indexed JARs first and then JARs whose Maven path matches the target package, so large projects need fewer calls.
 
 ### Changed
+
+- Responses are sized for agent contexts: large sources return 120 lines plus an outline, large bytecode returns member signatures, `view: "all"` and every other response are capped at 40,000 characters. Measured on `StringUtils`: default source 26K -> 7.5K tokens, bytecode 107K -> 5.8K, `view: "all"` 139K -> 11K.
+- Search results (`search_class`, `search_code`, `find_implementations`) are grouped by JAR in text output; `view: "api"` JSON no longer repeats the members as separate arrays.
+- Methods Vineflower cannot decompile keep its bytecode listing but not the decompiler's stack trace; the response names them.
+- Shorter shared parameter descriptions in `tools/list`.
 
 - Bundled Vineflower updated from 1.11.2 to 1.12.0 (`lib/vineflower-1.12.0.jar`, requires Java 17+ like before). The decompile cache key now includes the decompiler version and extraction scheme, so cached output from older runs is not reused.
 - Migrated to `@modelcontextprotocol/sdk` 1.32 (`McpServer.registerTool`, protocol 2025-11-25). Tool input schemas are now zod-validated and every parameter has a description.
@@ -24,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `view: "hierarchy"` lists the interfaces implemented at every level.
 
 ### Fixed
+
+- Multi-module Maven checkouts whose modules depend on each other failed classpath resolution until the modules were installed; the classpath is now recovered with `--fail-at-end` plus `dependency:tree`.
+- The message for a missing JDK `src.zip` says which package to install.
 
 - On a cold start `inspect_class` answered "Class not found" while Maven was still resolving the classpath, which pushed agents to locate JARs in `~/.m2` and pass `jarPath`. Class lookups now wait (bounded) for the classpath, open the JAR matching the package first, and tool descriptions state that `className` alone is enough for Maven dependencies.
 
